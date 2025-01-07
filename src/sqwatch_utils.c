@@ -58,7 +58,7 @@ void print_event_type(struct inotify_event *event) {
   fflush(stdout);  // Ensure partial line is displayed
 }
 
-void handle_events(int inotify_fd, int wd, const char *command, int flags) {
+void handle_events(int inotify_fd, int wd, const char *command, int flags, uint8_t debounce_t) {
   char buffer[BUF_LEN];
   int length;
   time_t last_event = 0;
@@ -77,7 +77,7 @@ void handle_events(int inotify_fd, int wd, const char *command, int flags) {
       struct inotify_event *event = (struct inotify_event *)&buffer[i];
       
       time_t now = time(NULL);
-      if (now - last_event >= 1) {
+      if (now - last_event >= debounce_t) {
         if (events_since_last_run > 0) {
           printf(DARK_GREY "+ Debounced: [ %s ]\n" RESET, event_buffer);  // Print debounced events
           event_buffer[0] = '\0';  // Clear the buffer
@@ -94,7 +94,7 @@ void handle_events(int inotify_fd, int wd, const char *command, int flags) {
                                                       event->mask & IN_MOVED_TO ? "Moved to" :
                                                       event->mask & IN_ATTRIB ? "Attributes" : "Unknown");
 
-        if (now - last_event >= 1) {
+        if (now - last_event >= debounce_t) {
           if (g_last_pid > 0) {
             kill(-g_last_pid, SIGTERM);
             waitpid(g_last_pid, NULL, 0);
@@ -141,17 +141,18 @@ void handle_events(int inotify_fd, int wd, const char *command, int flags) {
 }
 
 void print_usage(void) {
-  printf("Usage: sqwatch [-d directory] [-f file] -q event -c command\n");
+  printf("Usage: sqwatch [-d directory] [-f file] [-t debounce time] -q event -c command\n");
   printf("Options:\n");
-  printf("  -d directory  Directory to watch\n");
-  printf("  -f file       File to watch\n");
-  printf("  -q event      Event type to watch\n");
-  printf("                 all: all events\n");
-  printf("                 modify: file modifications\n");
-  printf("                 create: file creation\n");
-  printf("                 delete: file deletion\n");
-  printf("                 move: file moves\n");
-  printf("                 attrib: attribute changes\n");
-  printf("  -c command    Command to execute when events are detected\n");
-  printf("  -h            Display this help message\n");
+  printf("  -d directory      Directory to watch\n");
+  printf("  -f file           File to watch\n");
+  printf("  -t debounce time  Time (in seconds) after trigger to ignore events\n");
+  printf("  -q event          Event type to watch\n");
+  printf("                     all: all events\n");
+  printf("                     modify: file modifications\n");
+  printf("                     create: file creation\n");
+  printf("                     delete: file deletion\n");
+  printf("                     move: file moves\n");
+  printf("                     attrib: attribute changes\n");
+  printf("  -c command        Command to execute when events are detected\n");
+  printf("  -h                Display this help message\n");
 }

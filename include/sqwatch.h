@@ -11,7 +11,7 @@
 
 extern pid_t g_last_pid;
 int add_watch(int inotify_fd, const char *path, int flags);
-void handle_events(int inotify_fd, int wd, const char *command, int flags);
+void handle_events(int inotify_fd, int wd, const char *command, int flags, uint8_t debounce_t);
 void print_usage(void);
 
 #define EVENT_SIZE (sizeof(struct inotify_event))

@@ -33,6 +33,7 @@ int main(int argc, char *argv[]) {
     char *paths[MAX_PATHS];
     int path_count = 0;
     int opt;
+    uint32_t debounce_t = 1;
 
     inotify_fd = inotify_init();
     if (inotify_fd == -1) {
@@ -41,7 +42,7 @@ int main(int argc, char *argv[]) {
     }
     int flags = IN_MODIFY;  
 
-    while ((opt = getopt(argc, argv, "d:f:c:q:h")) != -1) {
+    while ((opt = getopt(argc, argv, "d:f:t:q:c:h")) != -1) {
         switch (opt) {
             case 'd':
             case 'f':
@@ -53,6 +54,10 @@ int main(int argc, char *argv[]) {
                 break;
             case 'c':
                 command = optarg;
+                break;
+            case 't':
+                debounce_t = atoi(optarg);
+                printf(GREEN "+ Debounce set to %d\n" RESET, debounce_t);
                 break;
             case 'q':
                 if (strcmp(optarg, "all") == 0) {
@@ -104,7 +109,7 @@ int main(int argc, char *argv[]) {
         printf(CYAN "+ Watch set for %s\n" RESET, paths[i]);
     }
 
-    handle_events(inotify_fd, wd, command, flags);
+    handle_events(inotify_fd, wd, command, flags, debounce_t);
 
     close(inotify_fd);
     cleanup(SIGTERM); 
