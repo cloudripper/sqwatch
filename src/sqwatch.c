@@ -57,22 +57,22 @@ int main(int argc, char *argv[]) {
             case 'q':
                 if (strcmp(optarg, "all") == 0) {
                     flags = IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVE | IN_ATTRIB;
-                    printf("Monitoring all events enabled\n");
+                    printf(GREEN "+ Monitoring all events enabled\n" RESET);
                 } else if (strcmp(optarg, "modify") == 0) {
                     flags = IN_MODIFY;
-                    printf("Monitoring modify event enabled\n");
+                    printf(GREEN "+ Monitoring modify event enabled\n" RESET);
                 } else if (strcmp(optarg, "create") == 0) {
                     flags = IN_CREATE;
-                    printf("Monitoring create event enabled\n");
+                    printf(GREEN "+ Monitoring create event enabled\n" RESET);
                 } else if (strcmp(optarg, "delete") == 0) {
                     flags = IN_DELETE;
-                    printf("Monitoring delete event enabled\n");
+                    printf(GREEN "+ Monitoring delete event enabled\n" RESET);
                 } else if (strcmp(optarg, "move") == 0) {
                     flags = IN_MOVE;
-                    printf("Monitoring move event enabled\n");
+                    printf(GREEN "+ Monitoring move event enabled\n" RESET);
                 } else if (strcmp(optarg, "attrib") == 0) {
                     flags = IN_ATTRIB;
-                    printf("Monitoring attribute events enabled\n");
+                    printf(GREEN "+ Monitoring attribute events enabled\n" RESET);
                 } else {
                     fprintf(stderr, "Invalid query option: %s\n", optarg);
                     print_usage();
@@ -98,10 +98,10 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < path_count; i++) {
         wd = add_watch(inotify_fd, paths[i], flags);
         if (wd == -1) {
-            fprintf(stderr, "Failed to add watch for %s\n", paths[i]);
+            fprintf(stderr, RED "+ Failed to add watch for %s\n" RESET, paths[i]);
             continue;
         }
-        printf("Watch set for %s\n", paths[i]);
+        printf(CYAN "+ Watch set for %s\n" RESET, paths[i]);
     }
 
     handle_events(inotify_fd, wd, command, flags);
