@@ -1,8 +1,8 @@
 # SQWatch
 
-*A Simple File System Event Watcher*
+*A Lightweight File System Monitor and Task Automation Tool*
 
-A lightweight tool that monitors file system events (create, modify, delete) and executes commands in response to these changes.
+Monitor files and directories for changes, execute commands automatically, and track modifications with built-in diff and logging capabilities. Designed for reliable file watching with minimal overhead.
 
 ## Overview
 
@@ -16,6 +16,12 @@ SQWatch monitors specified files or directories for quality changes (such as mod
 - Custom command execution
 - Low resource footprint
 - Simple integration with build tools
+- Diff tracking (binary and text) for file changes
+- Change logging with timestamps
+- Atomic save detection (works with modern editors, such as helix)
+- Recursive directory watching
+- Automatic watch recovery
+- Debounce support for rapid changes
 
 ## Dependencies
 
@@ -54,11 +60,11 @@ sudo install -D ./sqwatch /usr/local/bin/sqwatch
 
 Basic syntax:
 ```bash
-sqwatch [-d directory] [-f file] -q event -c command
+sqwatch [-d directory] [-f file] -q event [-c command] [--diff] [-l log_file] [-t debounce_time] [-v]
 ```
 
 Options:
-- `-d directory`: Directory to watch
+- `-d directory`: Directory to watch (recursively)
 - `-f file`: File to watch
 - `-q event`: Event type to watch
   - `all`: all events
@@ -68,6 +74,10 @@ Options:
   - `move`: file moves
   - `attrib`: attribute changes
 - `-c command`: Command to execute when events are detected
+- `--diff`: Enable diff tracking for file changes
+- `-l log_file`: Log file to write changes to (requires --diff)
+- `-t debounce_time`: Time in seconds to wait before processing new events (default: 1)
+- `-v`: Verbose output mode
 - `-h`: Display help message
 
 Examples:
@@ -75,11 +85,17 @@ Examples:
 # Watch a file for modifications and run a command
 sqwatch -f main.c -q modify -c "gcc main.c -o program && ./program"
 
-# Watch a directory for any changes and run tests
-sqwatch -d src/ -q all -c "make test"
+# Watch a directory recursively with diff tracking and logging
+sqwatch -d src/ -q all --diff -l changes.log -v
+
+# Watch directory with custom debounce time
+sqwatch -d src/ -q modify -t 2 -c "make test"
 ```
 
+## Environment Variables
 
+- `SQWATCH_CACHE_DIR`: Custom location for diff cache files
+- `XDG_CACHE_HOME`: Alternative cache directory base (defaults to ~/.cache)
 
 ## Contributing
 

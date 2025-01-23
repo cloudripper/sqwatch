@@ -13,6 +13,7 @@
 // Function declarations
 int copy_file(const char *src, const char *dest);
 void remove_directory(const char *path);
-void create_caches(int max_files, const char *cache_dir, char *watch_paths[], char *cached_paths[]);
-
+void create_caches(int max_files, const char *cache_dir, char *watch_paths[], char *cached_paths[], int verbose);
+void create_cache_for_file(const char *path, const char *cache_dir, 
+                          char **cached_path, int verbose);
 #endif // CACHE_H 
