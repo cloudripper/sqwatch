@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <limits.h>
 
+#include "cache.h"
 #include "sqwatch.h"
 #include "diff.h"
 
@@ -224,7 +225,7 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                     config.watch_paths[event->wd] = NULL;
                     
                     // Clean up cache path
-                    if (config.cached_paths && config.cached_paths[event->wd]) {
+                    if (config.cached_paths[event->wd]) {
                         if (config.verbose) {
                             printf(DARK_GREY "+ Removing cache for: %s\n" RESET, config.cached_paths[event->wd]);
                         }
