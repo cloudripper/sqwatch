@@ -140,7 +140,7 @@ static void add_watches_walk(int inotify_fd, const char *path, uint32_t flags, s
     } else if (S_ISREG(path_stat.st_mode)) {
         // Regular file handling remains unchanged
         int wd = add_watch(inotify_fd, path, watch_flags);
-        if (wd != -1 && wd < MAX_PATHS) {
+        if (wd >= 0 && wd < MAX_PATHS) {
             config->watch_paths[wd] = strdup(path);
             config->path_count++;
             if (config->verbose) {
@@ -214,7 +214,7 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                     } else if (S_ISREG(path_stat.st_mode)) {
                         // New file created - add watch
                         int new_wd = add_watch(inotify_fd, full_path, config.flags | IN_DONT_FOLLOW);
-                        if (new_wd != -1 && new_wd < MAX_PATHS) {
+                        if (new_wd >= 0 && new_wd < MAX_PATHS) {
                             // Free any existing path at this watch descriptor
                             if (config.watch_paths[new_wd]) {
                                 free(config.watch_paths[new_wd]);
@@ -288,7 +288,7 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                     if (stat(full_path, &path_stat) == 0) {  // File still exists
                         int new_wd = add_watch(inotify_fd, full_path, config.flags);
 
-                        if (new_wd != -1 && new_wd < MAX_PATHS) {
+                        if (new_wd >= 0 && new_wd < MAX_PATHS) {
                             // Free old path if it exists at new_wd
                             if (config.watch_paths[new_wd]) {
                                 free(config.watch_paths[new_wd]);
