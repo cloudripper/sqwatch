@@ -85,7 +85,7 @@ void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags, sqw
             // Add to directory watches
             if (config->dir_watch_count >= config->max_dir_watches) {
                 int new_size = config->max_dir_watches * 2;
-                dir_watch *new_watches = realloc(config->dir_watches, 
+                dir_watch *new_watches = realloc(config->dir_watches,
                                                new_size * sizeof(dir_watch));
                 if (!new_watches) {
                     fprintf(stderr, RED "+ Failed to allocate memory for dir watches\n" RESET);
@@ -94,11 +94,11 @@ void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags, sqw
                 config->dir_watches = new_watches;
                 config->max_dir_watches = new_size;
             }
-            
+
             config->dir_watches[config->dir_watch_count].path = strdup(path);
             config->dir_watches[config->dir_watch_count].wd = wd;
             config->dir_watch_count++;
-            
+
             if (config->verbose) {
                 printf(CYAN "+ Watch set for directory %s\n" RESET, path);
             }
@@ -152,10 +152,19 @@ void handle_events(int inotify_fd, sqwatch_config config) {
         }
 
         time_t now = time(NULL);  // Add time_t now declaration
-        int i = 0;
-        while (i < length) {
+        size_t i = 0;
+        while (i + EVENT_SIZE <= (size_t)length) {
             struct inotify_event *event = (struct inotify_event *)&buffer[i];
-            
+
+            // Reject invalid inotify descriptors
+            if (event->wd < 0) {
+                if (event->mask & IN_Q_OVERFLOW) {
+                    fprintf(stderr,RED "+ inotify event queue overflowed; events lost\n" RESET);
+                }
+                i += EVENT_SIZE + event->len;
+                continue;
+            }
+
             // Check if this is a directory watch event
             int is_dir_watch = 0;
             char *dir_path = NULL;
@@ -170,7 +179,7 @@ void handle_events(int inotify_fd, sqwatch_config config) {
             if (is_dir_watch && (event->mask & IN_CREATE)) {
                 char full_path[PATH_MAX];
                 snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, event->name);
-                
+
                 struct stat path_stat;
                 if (stat(full_path, &path_stat) == 0) {
                     if (S_ISREG(path_stat.st_mode)) {
@@ -182,17 +191,17 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                                 free(config.watch_paths[new_wd]);
                             }
                             config.watch_paths[new_wd] = strdup(full_path);
-                            
+
                             // Free any existing cache path before creating new one
                             if (config.cached_paths[new_wd]) {
                                 free(config.cached_paths[new_wd]);
                                 config.cached_paths[new_wd] = NULL;
                             }
-                            
+
                             if (config.diff_enabled && cache_dir) {
                                 create_cache_for_file(full_path, cache_dir, &config.cached_paths[new_wd], config.verbose);
                             }
-                            
+
                             if (config.verbose) {
                                 printf(CYAN "+ Added watch for new file: %s\n" RESET, full_path);
                             }
@@ -206,9 +215,9 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                 char full_path[PATH_MAX];
                 int watch_updated = 0;
                 int event_wd = event->wd;
-                
+
                 if (event->len > 0) {
-                    snprintf(full_path, sizeof(full_path), "%s/%s", 
+                    snprintf(full_path, sizeof(full_path), "%s/%s",
                             config.watch_paths[event_wd], event->name);
                 } else {
                     strncpy(full_path, config.watch_paths[event_wd], PATH_MAX - 1);
@@ -223,7 +232,7 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                     // Clean up watch path
                     free(config.watch_paths[event->wd]);
                     config.watch_paths[event->wd] = NULL;
-                    
+
                     // Clean up cache path
                     if (config.cached_paths[event->wd]) {
                         if (config.verbose) {
@@ -237,14 +246,14 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                     continue;
                 }
 
-                // IN_IGNORE is when text editors like helix save a file. 
+                // IN_IGNORE is when text editors like helix save a file.
                 // We need to reapply the watch to the file in case the file was not deleted.
                 if (event->mask & IN_IGNORED) {
                     watch_updated = 1;
                     struct stat path_stat;
                     if (stat(full_path, &path_stat) == 0) {  // File still exists
                         int new_wd = add_watch(inotify_fd, full_path, config.flags);
-                        
+
                         if (new_wd != -1 && new_wd < MAX_PATHS) {
                             // Free old path if it exists at new_wd
                             if (config.watch_paths[new_wd]) {
@@ -273,7 +282,7 @@ void handle_events(int inotify_fd, sqwatch_config config) {
 
                 // Handle the event as before
                 char event_desc[32];
-                snprintf(event_desc, sizeof(event_desc), "%s", 
+                snprintf(event_desc, sizeof(event_desc), "%s",
                     event->mask & IN_MODIFY ? "Modified" :
                     event->mask & IN_CREATE ? "Created" :
                     event->mask & IN_DELETE ? "Deleted" :
@@ -294,26 +303,26 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                     if (g_last_pid > 0) {
                         // Send SIGTERM to the entire process group
                         killpg(g_last_pid, SIGTERM);
-                        
+
                         // Wait a short time for graceful termination
                         struct timespec timeout = {0, 100000000}; // 100ms
                         nanosleep(&timeout, NULL);
-                        
+
                         // If process still exists, force kill
                         if (kill(-g_last_pid, 0) == 0) {
                             killpg(g_last_pid, SIGKILL);
                         }
-                        
+
                         // Wait for the process group to finish
                         while (waitpid(-g_last_pid, NULL, 0) > 0) {
                             // Continue waiting for all children
                         }
-                        
+
                         g_last_pid = 0;
                     }
-                    
+
                     if (!(event->mask & IN_IGNORED)) {
-                        printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET, 
+                        printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET,
                             config.watch_paths[event_wd], event_desc);
                     }
 
@@ -337,13 +346,13 @@ void handle_events(int inotify_fd, sqwatch_config config) {
 
                         // Parent continues without waiting
                     }
-                    
+
                     if (cache_dir && config.diff_enabled) {
                         if (event->mask & (IN_MODIFY | IN_IGNORED)) {
                             char event_desc[256];
                             snprintf(event_desc, sizeof(event_desc), "Modified");
-                            
-                            run_diff(config.watch_paths[event_wd], 
+
+                            run_diff(config.watch_paths[event_wd],
                                 cache_dir,
                                 event_desc,
                                 1, // diff is always verbose
