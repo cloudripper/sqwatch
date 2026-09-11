@@ -178,7 +178,11 @@ void handle_events(int inotify_fd, sqwatch_config config) {
 
             if (is_dir_watch && (event->mask & IN_CREATE)) {
                 char full_path[PATH_MAX];
-                snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, event->name);
+                if (snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, event->name) >= (int)sizeof(full_path)) {
+                    fprintf(stderr, RED "+ Path too long, skipping event\n" RESET);
+                    i += EVENT_SIZE + event->len;
+                    continue;
+                }
 
                 struct stat path_stat;
                 if (stat(full_path, &path_stat) == 0) {
@@ -215,12 +219,17 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                 char full_path[PATH_MAX];
                 int watch_updated = 0;
                 int event_wd = event->wd;
-
+                int plen;
                 if (event->len > 0) {
-                    snprintf(full_path, sizeof(full_path), "%s/%s",
-                            config.watch_paths[event_wd], event->name);
+                    plen = snprintf(full_path, sizeof(full_path), "%s/%s", config.watch_paths[event_wd], event->name);
                 } else {
-                    strncpy(full_path, config.watch_paths[event_wd], PATH_MAX - 1);
+                    plen = snprintf(full_path, sizeof(full_path), "%s", config.watch_paths[event_wd]);
+                }
+
+                if (plen < 0 || (size_t)plen >= sizeof(full_path)) {
+                    fprintf(stderr, RED "+ Path too long, skipping event\n" RESET);
+                    i += EVENT_SIZE + event->len;
+                    continue;
                 }
 
                 // Check if file still exists for any event
