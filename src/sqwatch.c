@@ -28,7 +28,7 @@ static void cleanup(int signo) {
   }
 
   // Wipe the cache directory if it exists
-  if (cache_dir) {
+  if (cache_dir && cache_dir_owned) {
     printf(RED "+ Wiping cache directory: %s\n" RESET, cache_dir);
     remove_directory(cache_dir);
   }
@@ -52,7 +52,7 @@ static void cleanup(int signo) {
       }
     }
     free(config.dir_watches);
-    
+
     close(inotify_fd);
   }
 
@@ -76,7 +76,7 @@ int main(int argc, char *argv[]) {
     config.watch_paths[i] = NULL;
     config.cached_paths[i] = NULL;
   }
-  
+
   // Initialize directory watch structures
   config.dir_watches = malloc(INITIAL_DIR_WATCHES * sizeof(dir_watch));
   if (!config.dir_watches) {

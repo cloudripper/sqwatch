@@ -8,6 +8,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+int cache_dir_owned = 0;
+
 int copy_file(const char *src, const char *dest) {
   struct stat statbuf;
 
@@ -59,10 +61,13 @@ void remove_directory(const char *path) {
       }
 
       char full_path[PATH_MAX];
-      snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
+      if (snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name) >= (int)sizeof(full_path)) {
+        fprintf(stderr, RED "Path too long, not removing %s/%s\n" RESET, path, entry->d_name);
+        continue;
+      }
 
       struct stat statbuf;
-      if (stat(full_path, &statbuf) == 0) {
+      if (lstat(full_path, &statbuf) == 0) {
         if (S_ISDIR(statbuf.st_mode)) {
           remove_directory(full_path);
         } else {
@@ -81,13 +86,18 @@ void create_caches(int max_files, const char *cache_dir, char *watch_paths[],
     return;
   }
 
-  // Create cache directory if it doesn't exist
-  struct stat st;
-  if (stat(cache_dir, &st) != 0) {
-    if (mkdir(cache_dir, 0755) != 0) {
-      perror("Failed to create cache directory");
-      return;
+  if (mkdir(cache_dir, 0700) == 0) {
+    cache_dir_owned = 1;
+  } else if (errno == EEXIST) {
+    struct stat st;
+    if (lstat(cache_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, RED "Cache path %s exists and is not a directory\n" RESET, cache_dir);
+        return;
     }
+    fprintf(stderr, DARK_GREY "+ Cache directory %s already exists; it will not be removed on exit\n" RESET, cache_dir);
+  } else {
+    perror("Failed to create cache directory");
+    return;
   }
 
   // For each watched path, create a cache file
@@ -113,19 +123,19 @@ void create_cache_for_file(const char *path, const char *cache_dir,
     if (!path || !cache_dir || !cached_path) {
         return;
     }
-    
+
     char *path_copy = strdup(path);
     if (!path_copy) {
         return;
     }
-    
+
     char *base = basename(path_copy);
     char cache_path[PATH_MAX];
     snprintf(cache_path, sizeof(cache_path), "%s/%s", cache_dir, base);
-    
+
     // Always update the cached_path pointer
     *cached_path = strdup(cache_path);
-    
+
     // Only copy the file if it doesn't exist in cache
     struct stat cache_stat;
     if (stat(cache_path, &cache_stat) != 0) {
@@ -135,6 +145,6 @@ void create_cache_for_file(const char *path, const char *cache_dir,
             }
         }
     }
-    
+
     free(path_copy);
 }
