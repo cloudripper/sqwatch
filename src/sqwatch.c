@@ -16,7 +16,6 @@
 pid_t g_last_pid = 0;
 char *cache_dir = NULL;
 sqwatch_config config;
-int inotify_fd;
 static const int INITIAL_DIR_WATCHES = 16;
 
 static void cleanup(int signo) {
@@ -31,29 +30,6 @@ static void cleanup(int signo) {
   if (cache_dir && cache_dir_owned) {
     printf(RED "+ Wiping cache directory: %s\n" RESET, cache_dir);
     remove_directory(cache_dir);
-  }
-
-  if (inotify_fd > 0) {
-    printf(RED "+ Removing watches\n" RESET);
-    // Clean up file watches
-    for (int i = 0; i < MAX_PATHS; i++) {
-      if (config.watch_paths[i]) {
-        inotify_rm_watch(inotify_fd, i);
-        free(config.watch_paths[i]);
-        config.watch_paths[i] = NULL;
-      }
-    }
-
-    // Clean up directory watches
-    for (int i = 0; i < config.dir_watch_count; i++) {
-      if (config.dir_watches[i].path) {
-        inotify_rm_watch(inotify_fd, config.dir_watches[i].wd);
-        free(config.dir_watches[i].path);
-      }
-    }
-    free(config.dir_watches);
-
-    close(inotify_fd);
   }
 
   free(cache_dir);
