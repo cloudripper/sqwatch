@@ -71,16 +71,26 @@ void print_event_type(struct inotify_event *event) {
   fflush(stdout);  // Ensure partial line is displayed
 }
 
-void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags, sqwatch_config *config) {
+static void add_watches_walk(int inotify_fd, const char *path, uint32_t flags, sqwatch_config *config, int follow_symlinks) {
     struct stat path_stat;
-    if (stat(path, &path_stat) == -1) {
+    int rc = follow_symlinks ? stat(path, &path_stat) : lstat(path, &path_stat);
+    if (rc == -1) {
         fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, path, strerror(errno));
         return;
     }
 
+    if (S_ISLNK(path_stat.st_mode)) {
+        if (config->verbose) {
+            printf(DARK_GREY "+ Skipping symlink %s\n" RESET, path);
+        }
+        return;
+    }
+
+    uint32_t watch_flags = follow_symlinks ? flags : (flags | IN_DONT_FOLLOW);
+
     if (S_ISDIR(path_stat.st_mode)) {
         // Add directory watch separately from file watches
-        int wd = add_watch(inotify_fd, path, flags | IN_CREATE);
+        int wd = add_watch(inotify_fd, path, watch_flags | IN_CREATE);
         if (wd != -1) {
             // Add to directory watches
             if (config->dir_watch_count >= config->max_dir_watches) {
@@ -118,13 +128,18 @@ void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags, sqw
             }
 
             char full_path[PATH_MAX];
-            snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
-            add_watches_recursive(inotify_fd, full_path, flags, config);
+            if (snprintf(full_path, sizeof(full_path), "%s/%s", path,
+                         entry->d_name) >= (int)sizeof(full_path)) {
+                fprintf(stderr, RED "+ Path too long, skipping %s/%s\n" RESET,
+                        path, entry->d_name);
+                continue;
+            }
+            add_watches_walk(inotify_fd, full_path, flags, config, 0);
         }
         closedir(dir);
     } else if (S_ISREG(path_stat.st_mode)) {
         // Regular file handling remains unchanged
-        int wd = add_watch(inotify_fd, path, flags);
+        int wd = add_watch(inotify_fd, path, watch_flags);
         if (wd != -1 && wd < MAX_PATHS) {
             config->watch_paths[wd] = strdup(path);
             config->path_count++;
@@ -134,6 +149,12 @@ void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags, sqw
         }
     }
 }
+
+void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags,
+                           sqwatch_config *config) {
+    add_watches_walk(inotify_fd, path, flags, config, 1);
+}
+
 
 void handle_events(int inotify_fd, sqwatch_config config) {
     char buffer[BUF_LEN];
@@ -185,10 +206,14 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                 }
 
                 struct stat path_stat;
-                if (stat(full_path, &path_stat) == 0) {
-                    if (S_ISREG(path_stat.st_mode)) {
+                if (lstat(full_path, &path_stat) == 0) {
+                    if (S_ISLNK(path_stat.st_mode)) {
+                        if (config.verbose) {
+                            printf(DARK_GREY "+ Skipping symlink %s\n" RESET, full_path);
+                        }
+                    } else if (S_ISREG(path_stat.st_mode)) {
                         // New file created - add watch
-                        int new_wd = add_watch(inotify_fd, full_path, config.flags);
+                        int new_wd = add_watch(inotify_fd, full_path, config.flags | IN_DONT_FOLLOW);
                         if (new_wd != -1 && new_wd < MAX_PATHS) {
                             // Free any existing path at this watch descriptor
                             if (config.watch_paths[new_wd]) {
