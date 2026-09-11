@@ -294,6 +294,11 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                                 free(config.watch_paths[new_wd]);
                             }
                             config.watch_paths[new_wd] = strdup(full_path);
+                            if (!config.watch_paths[new_wd]) {
+                                fprintf(stderr, RED "+ Out of memory tracking %s\n" RESET, full_path);
+                                i += EVENT_SIZE + event->len;
+                                continue;
+                            }
                             if (event_wd != new_wd) {
                                 config.cached_paths[new_wd] = config.cached_paths[event_wd];
                                 config.cached_paths[event_wd] = NULL;
@@ -308,9 +313,16 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                         if (config.verbose) {
                             printf(DARK_GREY "+ File no longer exists: %s\n" RESET, full_path);
                         }
-                        // Clean up the old watch path
                         free(config.watch_paths[event->wd]);
                         config.watch_paths[event->wd] = NULL;
+
+                        if (config.cached_paths[event->wd]) {
+                            unlink(config.cached_paths[event->wd]);
+                            free(config.cached_paths[event->wd]);
+                            config.cached_paths[event->wd] = NULL;
+                        }
+                        i += EVENT_SIZE + event->len;
+                        continue;
                     }
                 }
 
