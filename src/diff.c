@@ -224,7 +224,14 @@ void log_changes(const char *log_file, const char *path, const char *event_type,
 
   time_t now = time(NULL);
   char *timestamp = ctime(&now);
-  timestamp[strlen(timestamp) - 1] = '\0';
+  if (timestamp) {
+    size_t tlen = strlen(timestamp);
+    if (tlen > 0 && timestamp[tlen - 1] == '\n') {
+        timestamp[tlen - 1] = '\0';
+      }
+  } else {
+    timestamp = "(unknown time)";
+  }
 
   fprintf(log_fp, "\n=== Text File Diff ===\n");
   fprintf(log_fp, "Time: %s\n", timestamp);
@@ -397,7 +404,7 @@ void run_diff(const char *path, const char *cache_dir, const char *event_type,
         log_changes(log_file, path, "New content", &current, &cached);
       }
     }
-    
+
     // Update cache regardless of which case
     if (copy_file(path, cached_file_path) != 0) {
       fprintf(stderr, RED "Failed to update cache file: %s\n" RESET,
@@ -520,7 +527,14 @@ void log_bin_diff(const char *log_file, const char *path,
 
   time_t now = time(NULL);
   char *timestamp = ctime(&now);
-  timestamp[strlen(timestamp) - 1] = '\0';
+  if (timestamp) {
+    size_t tlen = strlen(timestamp);
+    if (tlen > 0 && timestamp[tlen - 1] == '\n') {
+      timestamp[tlen - 1] = '\0';
+    }
+  } else {
+    timestamp = "(unknown time)";
+  }
 
   fprintf(log_fp, "\n=== Binary File Diff ===\n");
   fprintf(log_fp, "Time: %s\n", timestamp);
