@@ -183,6 +183,14 @@ static void stop_command(void) {
 // Run the user's command in its own process group without waiting for it
 static void start_command(const char *command) {
     if (command != NULL) {
+        // Hold SIGTERM/SIGINT across fork so the child can never run the
+        // handlers installed for sqwatch itself
+        sigset_t block, prev;
+        sigemptyset(&block);
+        sigaddset(&block, SIGTERM);
+        sigaddset(&block, SIGINT);
+        sigprocmask(SIG_BLOCK, &block, &prev);
+
         g_last_pid = fork();
         if (g_last_pid == -1) {
             perror("fork");
@@ -191,6 +199,9 @@ static void start_command(const char *command) {
 
         if (g_last_pid == 0) {
             // Child process
+            signal(SIGTERM, SIG_DFL);
+            signal(SIGINT, SIG_DFL);
+            sigprocmask(SIG_SETMASK, &prev, NULL);
             setpgid(0, 0);  // Create new process group
             setvbuf(stdout, NULL, _IONBF, 0);
             setvbuf(stderr, NULL, _IONBF, 0);
@@ -200,7 +211,10 @@ static void start_command(const char *command) {
             exit(EXIT_FAILURE);
         }
 
-        // Parent continues without waiting
+        // Also set the group from the parent so a stop right after the
+        // start cannot miss it; fails harmlessly once the child has exec'd
+        setpgid(g_last_pid, g_last_pid);
+        sigprocmask(SIG_SETMASK, &prev, NULL);
     }
 }
 
