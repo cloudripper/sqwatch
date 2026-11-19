@@ -156,6 +156,18 @@ void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags,
 }
 
 
+// Copy a path for display, replacing control characters so a file name
+// cannot inject terminal escapes or extra lines into the output
+static const char *printable(const char *path, char *buf, size_t size) {
+    size_t i = 0;
+    for (; path[i] != '\0' && i + 1 < size; i++) {
+        unsigned char c = (unsigned char)path[i];
+        buf[i] = (c < 0x20 || c == 0x7f) ? '?' : (char)c;
+    }
+    buf[i] = '\0';
+    return buf;
+}
+
 // Terminate the process group of the previously started command, if any
 static void stop_command(void) {
     if (g_last_pid > 0) {
@@ -309,7 +321,9 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                     // swallow a write to the new file that follows
                     if ((config.flags & IN_CREATE) && now - last_create >= config.debounce_t) {
                         stop_command();
-                        printf(CYAN "+ Trigger on %s: [ Created ]\n" RESET, full_path);
+                        char shown[PATH_MAX];
+                        printf(CYAN "+ Trigger on %s: [ Created ]\n" RESET,
+                            printable(full_path, shown, sizeof(shown)));
                         start_command(config.command);
                         last_create = now;
                     }
@@ -422,8 +436,10 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                     stop_command();
 
                     if (!(event->mask & IN_IGNORED)) {
+                        char shown[PATH_MAX];
                         printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET,
-                            config.watch_paths[event_wd], event_desc);
+                            printable(config.watch_paths[event_wd], shown, sizeof(shown)),
+                            event_desc);
                     }
 
                     start_command(config.command);
