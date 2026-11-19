@@ -156,9 +156,58 @@ void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags,
 }
 
 
+// Terminate the process group of the previously started command, if any
+static void stop_command(void) {
+    if (g_last_pid > 0) {
+        // Send SIGTERM to the entire process group
+        killpg(g_last_pid, SIGTERM);
+
+        // Wait a short time for graceful termination
+        struct timespec timeout = {0, 100000000}; // 100ms
+        nanosleep(&timeout, NULL);
+
+        // If process still exists, force kill
+        if (kill(-g_last_pid, 0) == 0) {
+            killpg(g_last_pid, SIGKILL);
+        }
+
+        // Wait for the process group to finish
+        while (waitpid(-g_last_pid, NULL, 0) > 0) {
+            // Continue waiting for all children
+        }
+
+        g_last_pid = 0;
+    }
+}
+
+// Run the user's command in its own process group without waiting for it
+static void start_command(const char *command) {
+    if (command != NULL) {
+        g_last_pid = fork();
+        if (g_last_pid == -1) {
+            perror("fork");
+            exit(EXIT_FAILURE);
+        }
+
+        if (g_last_pid == 0) {
+            // Child process
+            setpgid(0, 0);  // Create new process group
+            setvbuf(stdout, NULL, _IONBF, 0);
+            setvbuf(stderr, NULL, _IONBF, 0);
+            char *const args[] = {"/bin/sh", "-c", (char *)command, NULL};
+            execve("/bin/sh", args, environ);
+            perror("execve");
+            exit(EXIT_FAILURE);
+        }
+
+        // Parent continues without waiting
+    }
+}
+
 void handle_events(int inotify_fd, sqwatch_config config) {
     char buffer[BUF_LEN];
     time_t last_event = 0;
+    time_t last_create = 0;
     int events_since_last_run = 0;
     char event_buffer[256] = "";
 
@@ -238,6 +287,17 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                     } else if (S_ISDIR(path_stat.st_mode)) {
                         // New directory created - add recursive watches
                         add_watches_recursive(inotify_fd, full_path, config.flags, &config);
+                    }
+
+                    // Directory watches always carry IN_CREATE to pick up new
+                    // files; only run the command if create was requested.
+                    // Creates are debounced on their own so they cannot
+                    // swallow a write to the new file that follows
+                    if ((config.flags & IN_CREATE) && now - last_create >= config.debounce_t) {
+                        stop_command();
+                        printf(CYAN "+ Trigger on %s: [ Created ]\n" RESET, full_path);
+                        start_command(config.command);
+                        last_create = now;
                     }
                 }
             } else if (!is_dir_watch && event->wd < MAX_PATHS && config.watch_paths[event->wd]) {
@@ -345,53 +405,14 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                     event->mask & IN_IGNORED ? "Watch removed" : "Unknown");
 
                 if (now - last_event >= config.debounce_t || watch_updated) {
-                    // Properly terminate any existing process group
-                    if (g_last_pid > 0) {
-                        // Send SIGTERM to the entire process group
-                        killpg(g_last_pid, SIGTERM);
-
-                        // Wait a short time for graceful termination
-                        struct timespec timeout = {0, 100000000}; // 100ms
-                        nanosleep(&timeout, NULL);
-
-                        // If process still exists, force kill
-                        if (kill(-g_last_pid, 0) == 0) {
-                            killpg(g_last_pid, SIGKILL);
-                        }
-
-                        // Wait for the process group to finish
-                        while (waitpid(-g_last_pid, NULL, 0) > 0) {
-                            // Continue waiting for all children
-                        }
-
-                        g_last_pid = 0;
-                    }
+                    stop_command();
 
                     if (!(event->mask & IN_IGNORED)) {
                         printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET,
                             config.watch_paths[event_wd], event_desc);
                     }
 
-                    if (config.command != NULL) {
-                        g_last_pid = fork();
-                        if (g_last_pid == -1) {
-                            perror("fork");
-                            exit(EXIT_FAILURE);
-                        }
-
-                        if (g_last_pid == 0) {
-                            // Child process
-                            setpgid(0, 0);  // Create new process group
-                            setvbuf(stdout, NULL, _IONBF, 0);
-                            setvbuf(stderr, NULL, _IONBF, 0);
-                            char *const args[] = {"/bin/sh", "-c", (char *)config.command, NULL};
-                            execve("/bin/sh", args, environ);
-                            perror("execve");
-                            exit(EXIT_FAILURE);
-                        }
-
-                        // Parent continues without waiting
-                    }
+                    start_command(config.command);
 
                     if (cache_dir && config.diff_enabled) {
                         if (event->mask & (IN_MODIFY | IN_IGNORED)) {
