@@ -4,11 +4,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/types.h>
+#include <time.h>
 
 // Colors for output formatting
 #define DARK_GREY "\033[90m"
 #define RED "\033[31m"
 #define RESET "\033[0m"
+
+// A watched file larger than this is not copied into the cache; see copy_file()
+#define CACHE_MAX_BYTES (64 << 20)
 
 extern int cache_dir_owned;
 extern int cache_dir_fd;
@@ -20,6 +24,7 @@ int copy_file(const char *src, const char *dest, const char *shown_path);
 char *cache_new_entry(const char *cache_dir);
 int unlink_cache_file(const char *path);
 int cache_differs(const char *io_path, const char *path);
+int cache_stub(const char *path, off_t *size, struct timespec *mtime);
 void remove_caches(void);
 int create_caches(const char *cache_dir);
 int open_log_file(const char *log_file);

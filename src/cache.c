@@ -119,9 +119,61 @@ int open_watched_file(const char *io_path) {
   return fd;
 }
 
+// Whether the cache entry path holds only the size and modification time of
+// a watched file too large to copy (see copy_file()): such an entry is the
+// only one made read-only. Returns 1 and fills size and mtime if so, 0 if it
+// holds a copy, -1 if it cannot be read
+int cache_stub(const char *path, off_t *size, struct timespec *mtime) {
+  int fd = open_cache_file(path, O_RDONLY);
+  struct stat st;
+  if (fd < 0) {
+    return -1;
+  }
+  int stub = fstat(fd, &st) != 0 ? -1 : !(st.st_mode & S_IWUSR);
+  if (stub == 1) {
+    char record[96];
+    ssize_t n = read(fd, record, sizeof(record) - 1);
+    long long bytes = -1, sec = 0;
+    long nsec = 0;
+    record[n > 0 ? n : 0] = '\0';
+    if (sscanf(record, "%lld %lld %ld", &bytes, &sec, &nsec) != 3) {
+      bytes = -1;  // Never equal to a real size
+    }
+    if (size) {
+      *size = (off_t)bytes;
+    }
+    if (mtime) {
+      mtime->tv_sec = (time_t)sec;
+      mtime->tv_nsec = nsec;
+    }
+  }
+  close(fd);
+  return stub;
+}
+
+// Make the open cache entry dest_fd hold only the size and modification time
+// of the watched file src_fd, and make it read-only, which marks it so
+static int write_stub(int dest_fd, int src_fd) {
+  struct stat st;
+  char record[96];
+  if (fstat(src_fd, &st) != 0) {
+    return -1;
+  }
+  int len = snprintf(record, sizeof(record), "%lld %lld %ld\n", (long long)st.st_size,
+                     (long long)st.st_mtim.tv_sec, (long)st.st_mtim.tv_nsec);
+  if (ftruncate(dest_fd, 0) != 0 || pwrite(dest_fd, record, len, 0) != len ||
+      fchmod(dest_fd, 0400) != 0) {
+    return -1;
+  }
+  return 0;
+}
+
 // Copy the watched file src into the cache entry dest; shown names the watched
 // file in messages. When the copy fails the entry is removed, so that a part
-// of a copy is never read as the file's
+// of a copy is never read as the file's. A file larger than CACHE_MAX_BYTES is
+// not copied: the entry keeps its size and modification time (see
+// cache_stub()), and a notice says so when that starts. A sparse file counts
+// by its size, so its holes are never written out
 int copy_file(const char *src, const char *dest, const char *shown_path) {
   struct stat statbuf;
 
@@ -132,6 +184,7 @@ int copy_file(const char *src, const char *dest, const char *shown_path) {
             shown_name(shown_path));
     return -1;
   }
+  int was_stub = cache_stub(dest, NULL, NULL) == 1;
 
   int src_fd = open_watched_file(src);
   if (src_fd < 0) {
@@ -155,17 +208,41 @@ int copy_file(const char *src, const char *dest, const char *shown_path) {
     return -1;
   }
 
-  char buffer[4096];
-  ssize_t bytes_read;
-  while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0) {
+  struct stat src_st;
+  int too_large = fstat(src_fd, &src_st) == 0 && src_st.st_size > CACHE_MAX_BYTES;
+  char buffer[65536];
+  ssize_t bytes_read = 0;
+  off_t total = 0;
+  while (!too_large && (bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0) {
     stop_if_signalled();
-    ssize_t result = write(dest_fd, buffer, bytes_read);
-    if (result < 0) {
+    if (total + bytes_read > CACHE_MAX_BYTES) {
+      too_large = 1;  // It grew while being copied
+      break;
+    }
+    for (ssize_t done = 0; done < bytes_read;) {
+      ssize_t result = write(dest_fd, buffer + done, bytes_read - done);
+      if (result <= 0) {
+        perror("Failed to write to destination file");
+        close(src_fd);
+        close(dest_fd);
+        unlink_cache_file(dest);
+        return -1;
+      }
+      done += result;
+    }
+    total += bytes_read;
+  }
+  if (too_large) {
+    if (write_stub(dest_fd, src_fd) != 0) {
       perror("Failed to write to destination file");
       close(src_fd);
       close(dest_fd);
       unlink_cache_file(dest);
       return -1;
+    }
+    if (!was_stub) {
+      fprintf(stderr, DARK_GREY "+ Not keeping a copy of %s: it is over the %d MiB cache limit; only its size and modification time are kept\n" RESET,
+              shown_name(shown_path), CACHE_MAX_BYTES >> 20);
     }
   }
 
@@ -175,14 +252,24 @@ int copy_file(const char *src, const char *dest, const char *shown_path) {
 }
 
 // Whether the watched file read through io_path differs from the cache entry
-// path: 1 if it does or either cannot be read, 0 if they are the same
+// path: 1 if it does or either cannot be read, 0 if they are the same. An
+// entry that kept only the size and modification time compares those
 int cache_differs(const char *io_path, const char *path) {
-  int src_fd = open_watched_file(io_path);
-  int cache_fd = src_fd < 0 ? -1 : open_cache_file(path, O_RDONLY);
+  off_t stub_size;
+  struct timespec stub_mtime;
+  int stub = cache_stub(path, &stub_size, &stub_mtime);
+  int src_fd = stub < 0 ? -1 : open_watched_file(io_path);
+  int cache_fd = src_fd < 0 || stub ? -1 : open_cache_file(path, O_RDONLY);
   struct stat src_st, cache_st;
-  int differs = src_fd < 0 || cache_fd < 0 || fstat(src_fd, &src_st) != 0 ||
-                fstat(cache_fd, &cache_st) != 0 || src_st.st_size != cache_st.st_size;
-  while (!differs) {
+  int differs = src_fd < 0 || fstat(src_fd, &src_st) != 0;
+  if (!differs && stub) {
+    differs = src_st.st_size != stub_size || src_st.st_mtim.tv_sec != stub_mtime.tv_sec ||
+              src_st.st_mtim.tv_nsec != stub_mtime.tv_nsec;
+  } else if (!differs) {
+    differs = cache_fd < 0 || fstat(cache_fd, &cache_st) != 0 ||
+              src_st.st_size != cache_st.st_size;
+  }
+  while (!differs && !stub) {
     char a[65536], b[sizeof(a)];
     ssize_t n = read(src_fd, a, sizeof(a));
     if (n <= 0) {

@@ -2,6 +2,7 @@
 #define DIFF_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 
 // Colors for output formatting
@@ -13,10 +14,33 @@
 
 #define MAX_BIN_DIFFS 16
 
+// A text file larger than this, or with more lines, is not diffed line by
+// line: it is only said to have changed
+#define DIFF_MAX_BYTES (8 << 20)
+#define DIFF_MAX_LINES 1000000
+// Lines removed plus lines added past which the changes are not worked out
+// line by line: the whole file is said to have changed. The work spent
+// looking for them is bounded too
+#define DIFF_MAX_EDITS 2000
+#define DIFF_MAX_STEPS 200000000L
+
+// A file read whole into one buffer, each line ended by a NUL in place of its
+// newline. Line i starts at data + start[i]; start[count] is one past the
+// NUL of the last line. data is NULL for an empty file
 typedef struct {
-    char **lines;
+    char *data;
+    uint32_t *start;
     int count;
 } file_lines;
+
+// Lines removed from the cached copy and lines added in the current file at
+// one place, with no line in common between them
+typedef struct {
+    int cached_at;           // Index of the first line removed, or where
+    int removed;             // lines are added if none is
+    int current_at;          // Index of the first line added, or of the line
+    int added;               // where lines were removed if none is
+} diff_hunk;
 
 struct diff_entry {
     size_t offset;
@@ -27,10 +51,11 @@ struct diff_entry {
 // Function declarations
 // path is the name shown in messages and the log; io_path is what is read
 void run_diff(const char *path, const char *io_path, const char *cached_file_path, const char *event_type, int verbose, const char *log_file);
-void print_diff(file_lines *current, file_lines *cached, int verbose);
-void read_file(const char *filename, char **content, size_t *length);
-void log_changes(const char *log_file, const char *path, const char *event_type, 
-                file_lines *current, file_lines *cached);
+void print_diff(const file_lines *current, const file_lines *cached, const diff_hunk *hunks,
+                int count, int verbose);
+void log_changes(const char *log_file, const char *path, const char *event_type,
+                 const file_lines *current, const file_lines *cached, const diff_hunk *hunks,
+                 int count);
 int is_binary_file(const char *filename, const char *io_path);
 void print_bin_diff(const char *path, const char *io_path, const char *cached_file_path, const char *log_file);
 void log_bin_diff(const char *log_file, const char *path, 
