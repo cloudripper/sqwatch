@@ -13,6 +13,7 @@
 extern int cache_dir_owned;
 
 // Function declarations
+int open_cache_file(const char *path, int flags);
 int copy_file(const char *src, const char *dest);
 void remove_directory(const char *path);
 int create_caches(const char *cache_dir);

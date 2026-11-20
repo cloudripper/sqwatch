@@ -19,14 +19,26 @@ static void free_file_lines(file_lines *fl) {
   }
 }
 
-// filename is the name shown in messages; the file is read through io_path
-static file_lines read_file_lines(const char *filename, const char *io_path) {
+// Open a cache file for reading; see open_cache_file()
+static FILE *fopen_cache(const char *path) {
+  int fd = open_cache_file(path, O_RDONLY);
+  FILE *file = fd < 0 ? NULL : fdopen(fd, "r");
+  if (fd >= 0 && !file) {
+    close(fd);
+  }
+  return file;
+}
+
+// filename is the name shown in messages; the file is read through io_path,
+// which names a file in the cache directory if cache_side is set
+static file_lines read_file_lines(const char *filename, const char *io_path, int cache_side) {
   file_lines fl = {NULL, 0};
   int retry_count = 0;
   FILE *file = NULL;
 
   // Try to open the file a few times with a small delay
-  while ((file = fopen(io_path, "r")) == NULL && retry_count < 3) {
+  while ((file = cache_side ? fopen_cache(io_path) : fopen(io_path, "r")) == NULL &&
+         retry_count < 3) {
     usleep(10000); // Wait 10ms between retries
     retry_count++;
   }
@@ -387,8 +399,8 @@ void run_diff(const char *path, const char *io_path, const char *cache_dir,
     return;
   }
 
-  file_lines current = read_file_lines(path, io_path);
-  file_lines cached = read_file_lines(cached_file_path, cached_file_path);
+  file_lines current = read_file_lines(path, io_path, 0);
+  file_lines cached = read_file_lines(cached_file_path, cached_file_path, 1);
 
   // First check if either file is empty
   if (!current.lines || !cached.lines) {
@@ -449,7 +461,7 @@ void run_diff(const char *path, const char *io_path, const char *cache_dir,
 void print_bin_diff(const char *path, const char *io_path,
                     const char *cached_path, const char *log_file) {
   FILE *f1 = fopen(io_path, "rb");
-  FILE *f2 = fopen(cached_path, "rb");
+  FILE *f2 = fopen_cache(cached_path);
 
   if (!f1 || !f2) {
     if (f1)

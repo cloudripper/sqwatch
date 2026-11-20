@@ -10,11 +10,30 @@
 
 int cache_dir_owned = 0;
 
+// Open a file in the cache directory, which others may be able to write to:
+// a symlink planted under the name is not followed, and O_NONBLOCK keeps a
+// FIFO from blocking the open. Anything but a regular file is refused
+int open_cache_file(const char *path, int flags) {
+  int fd = open(path, flags | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    return -1;
+  }
+
+  struct stat st;
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    close(fd);
+    errno = EINVAL;
+    return -1;
+  }
+  fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+  return fd;
+}
+
 int copy_file(const char *src, const char *dest) {
   struct stat statbuf;
 
   // Check if the destination is a directory
-  if (stat(dest, &statbuf) == 0 && S_ISDIR(statbuf.st_mode)) {
+  if (lstat(dest, &statbuf) == 0 && S_ISDIR(statbuf.st_mode)) {
     fprintf(stderr, "Failed to open destination file: %s is a directory\n",
             dest);
     return -1;
@@ -28,7 +47,7 @@ int copy_file(const char *src, const char *dest) {
 
   // The cache file name comes from the watched tree; never write through a
   // symlink planted under that name
-  int dest_fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+  int dest_fd = open_cache_file(dest, O_WRONLY | O_CREAT | O_TRUNC);
   if (dest_fd < 0) {
     perror("Failed to open destination file");
     close(src_fd);
@@ -128,7 +147,7 @@ void create_cache_for_file(const char *path, const char *io_path, const char *ca
 
     // Only copy the file if it doesn't exist in cache
     struct stat cache_stat;
-    if (stat(cache_path, &cache_stat) != 0) {
+    if (lstat(cache_path, &cache_stat) != 0) {
         if (copy_file(io_path, cache_path) == 0) {
             if (verbose) {
                 printf(DARK_GREY "+ Cached: %s -> %s\n" RESET, path, cache_path);
