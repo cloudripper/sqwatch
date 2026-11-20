@@ -87,7 +87,7 @@ Command:
 - `-s SIGNAL`: Signal that stops a run, on a restart and when sqwatch exits: a name, with or without `SIG`, in any case (`TERM`, `sigint`, `RTMIN+2`), or a number (default: `TERM`). What is left of the run's process group gets `KILL` 2 s later on a restart, 5 s later (or at a second signal to sqwatch) on exit. `STOP`, `TSTP`, `TTIN` and `TTOU` are refused, as they would pause the command instead of stopping it, and so is `CONT`, which stops nothing
 - The command gets the change that started it in its environment, never in the command string:
   - `SQWATCH_PATH`: the path of the file or directory, as sqwatch shows it (relative to the `-d` or `-f` path given), byte for byte
-  - `SQWATCH_EVENT`: `modify`, `create`, `delete`, `move`, `attrib`, `open` or `access`; `overflow`, with an empty `SQWATCH_PATH`, when events were lost and the tree was walked again without `--diff`, or when a directory could not be watched
+  - `SQWATCH_EVENT`: `modify`, `create`, `delete`, `move`, `attrib`, `open` or `access`; `overflow`, with an empty `SQWATCH_PATH`, when events were lost and the tree was walked again, or when a directory could not be watched. After lost events sqwatch says so with a trigger line, walks the tree again (at most once a second, and once more after the last loss), reports each file it no longer finds as deleted and each new one as created, diffs each file that changed, and runs the command once, with `overflow`
 
   Quote them: `sqwatch -d src -c 'echo "changed: $SQWATCH_PATH ($SQWATCH_EVENT)"'`. When changes come together (in one batch of events, or inside the debounce window of the last run), they lead to one run, and that run gets the latest of them.
 - `-t SECONDS`: Debounce time of each file, a decimal number of seconds such as `2` or `0.25`, from 0 to 86400 (default: 1, or 0 in observe mode)
@@ -107,7 +107,7 @@ Intercept (fanotify; needs the `CAP_SYS_ADMIN` capability, that is, root):
 - `-T TIMEOUT`: Time the command has to decide, a decimal number of seconds above 0 (default: 5). When it runs out, the command's process group is killed and the access allowed; `deny` or `SECONDS:deny` denies it instead (fails closed)
 
 Diff:
-- `--diff`: Show what changed in each file, from a private cache
+- `--diff`: Show what changed in each file, from a private cache. A file over 64 MiB is not copied, nor one that would take all the copies together over 256 MiB: only its size and modification time are kept, and a change to it is reported without a diff (a notice says when that starts)
 - `-l FILE`: Also write the diffs to FILE (needs `--diff`)
 
 Other:

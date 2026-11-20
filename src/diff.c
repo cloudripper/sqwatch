@@ -589,10 +589,15 @@ void run_diff(const char *path, const char *io_path, const char *cached_file_pat
   struct timespec kept_mtime;
   struct stat st;
   int stub = cache_stub(cached_file_path, &kept_size, &kept_mtime);
-  if (stub == 1 || (stat(io_path, &st) == 0 && st.st_size > CACHE_MAX_BYTES)) {
+  if (stub > 0 || (stat(io_path, &st) == 0 && st.st_size > CACHE_MAX_BYTES)) {
     if (cache_differs(io_path, cached_file_path)) {
-      snprintf(why, sizeof(why), "too large to diff (over the %d MiB cache limit: only its size and modification time are compared)",
-               CACHE_MAX_BYTES >> 20);
+      if (stub == STUB_BUDGET) {
+        snprintf(why, sizeof(why), "not diffed (the cache is full, %d MiB for all files: only its size and modification time are compared)",
+                 CACHE_BUDGET_BYTES >> 20);
+      } else {
+        snprintf(why, sizeof(why), "too large to diff (over the %d MiB cache limit: only its size and modification time are compared)",
+                 CACHE_MAX_BYTES >> 20);
+      }
       report_change(path, event_type, log_file, why);
       if (copy_file(io_path, cached_file_path, path) != 0) {
         fprintf(stderr, RED "Failed to update the cache of %s\n" RESET, shown_name(path));

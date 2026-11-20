@@ -115,6 +115,7 @@ typedef struct {
     int inotify_fd;
     unsigned scan;           // Rescans so far
     int creating;            // Watching an entry an IN_CREATE event named
+    int rescanning;          // In a walk after lost events: new files are reported
     int watch_failed;        // Watches that could not be set: coverage is not whole
     file_entry **changed;    // Files to diff against their cache entry, as
     size_t changed_count;    // they may have changed without an event of

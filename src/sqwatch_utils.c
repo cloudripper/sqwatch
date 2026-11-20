@@ -1080,6 +1080,10 @@ static file_entry *watch_file(sqwatch_config *config, dir_entry *dir, int dir_fd
         create_cache_for_file(path, io_path, cache_dir, &f->inode->cached, config->verbose);
         own_reads(config, dir, 0);
     }
+    if (added && config->rescanning) {
+        printf(CYAN "+ Trigger on %s: [ %s ] (found by the walk after lost events)\n" RESET,
+               shown_name(path), "Created");
+    }
     if (added && config->verbose) {
         if (at_runtime == 2) {
             printf(CYAN "+ Added watch for new file: %s\n" RESET, shown_name(path));
@@ -1741,6 +1745,8 @@ typedef struct {
     int rerun;               // -w: a run waits for the running one to end
     char *command_path;      // The latest change a run was asked for: what
     const char *command_event;  // the run gets as SQWATCH_PATH and _EVENT
+    long long last_rescan;   // When the tree was last walked after lost events
+    int rescan_due;          // Events were lost since: walk again when due
 } event_loop;
 
 static long long now_ms(void) {
@@ -1756,6 +1762,10 @@ static long long now_ms(void) {
 static void run_command(event_loop *loop, const char *path, const char *event) {
     if (loop->config->perm) {
         return;  // With -p the command only decides permission events
+    }
+    if ((loop->command_wanted || loop->command_due || loop->rerun) && loop->command_event &&
+        strcmp(loop->command_event, "overflow") == 0) {
+        return;  // A run for lost events stands for every change since
     }
     char *copy = strdup(path);
     if (copy) {
@@ -1919,15 +1929,30 @@ static void fire_file_fd(event_loop *loop, file_entry *f, uint32_t mask, int qui
     }
 }
 
+// After lost events the tree is walked again (see rescan()), at most once in
+// this many ms
+#define RESCAN_MS 1000
+static void rescan(event_loop *loop);
+
 // Handle the deferred events whose debounce window has closed, and the
 // deferred command run. Returns the ms until the next of them is due, or -1
 // if none is
 static int run_due(event_loop *loop) {
     sqwatch_config *config = loop->config;
-    long long next = departed_expire(0);
     loop->now = now_ms();
+    if (loop->rescan_due) {
+        if (loop->now - loop->last_rescan >= RESCAN_MS) {
+            rescan(loop);  // The walk put off after lost events
+            loop->now = now_ms();
+        }
+    }
+    long long next = departed_expire(0);
     if (next >= 0) {
         next += loop->now;
+    }
+    if (loop->rescan_due) {
+        long long due = loop->last_rescan + RESCAN_MS;
+        next = next < 0 || due < next ? due : next;
     }
     for (size_t i = 0; i < config->pending_count;) {
         file_entry *f = config->pending[i];
@@ -2299,13 +2324,20 @@ static int on_dir_event(event_loop *loop, dir_entry *dir, const struct inotify_e
     return consumed;
 }
 
+static void diff_changed(event_loop *loop);
+
 // Events were lost: walk every root again. New files and directories are
-// watched and cached, what was not found again is dropped, and every file
-// whose content differs from its cache entry is marked changed. Without a
-// cache what changed is not known: the command is run
+// watched and cached, and reported as created; what was not found again is
+// dropped, and reported as deleted; every file whose content differs from its
+// cache entry is diffed. A file whose size and times are still those its
+// cache entry was made from is not read. The command is run once, for the
+// lost events
 static void rescan(event_loop *loop) {
     sqwatch_config *config = loop->config;
+    loop->last_rescan = now_ms();
+    loop->rescan_due = 0;
     config->scan++;
+    config->rescanning = 1;
     departed_expire(1);
     for (int r = 0; r < config->root_count; r++) {
         watch_root *root = &config->roots[r];
@@ -2325,6 +2357,11 @@ static void rescan(event_loop *loop) {
             stop_if_signalled();
         }
         if (files[i]->seen != config->scan) {
+            char path[PATH_MAX];
+            if (file_path(config, files[i], path, sizeof(path))) {
+                printf(CYAN "+ Trigger on %s: [ %s ] (found by the walk after lost events)\n" RESET,
+                       shown_name(path), describe(IN_DELETE));
+            }
             file_free(config, files[i]);
             files[i] = NULL;
         }
@@ -2356,33 +2393,39 @@ static void rescan(event_loop *loop) {
         }
     }
     free(stale);
+    config->rescanning = 0;
 
-    if (!config->diff_enabled || !cache_dir) {
-        run_command(loop, "", "overflow");
-        return;
+    if (config->diff_enabled && cache_dir) {
+        files = file_list(config, &count);
+        for (size_t i = 0; i < count; i++) {
+            if ((++steps & 255) == 0) {
+                stop_if_signalled();
+            }
+            file_entry *f = files[i];
+            if (!cache_of(f) || f->changed_at || f->inode->names[0] != f) {
+                continue;  // One check per inode
+            }
+            int fd = open_file(config, f);
+            char io_path[FD_PATH_LEN];
+            int differs = 0;
+            if (fd != -1) {
+                fd_path(fd, io_path, sizeof(io_path));
+                if (!cache_unchanged(io_path, cache_of(f))) {
+                    own_reads(config, f->dir, 1);
+                    differs = cache_differs(io_path, cache_of(f));
+                    own_reads(config, f->dir, 0);
+                }
+                close(fd);
+            }
+            if (differs) {
+                mark_changed(config, f, CHANGED_RESCAN);
+            }
+        }
+        free(files);
+        diff_changed(loop);
     }
-    files = file_list(config, &count);
-    for (size_t i = 0; i < count; i++) {
-        stop_if_signalled();
-        file_entry *f = files[i];
-        if (!cache_of(f) || f->changed_at || f->inode->names[0] != f) {
-            continue;  // One check per inode
-        }
-        int fd = open_file(config, f);
-        char io_path[FD_PATH_LEN];
-        int differs = 0;
-        if (fd != -1) {
-            fd_path(fd, io_path, sizeof(io_path));
-            own_reads(config, f->dir, 1);
-            differs = cache_differs(io_path, cache_of(f));
-            own_reads(config, f->dir, 0);
-            close(fd);
-        }
-        if (differs) {
-            mark_changed(config, f, CHANGED_RESCAN);
-        }
-    }
-    free(files);
+    // The run is for the lost events, whatever was found
+    run_command(loop, "", "overflow");
 }
 
 // Diff the files marked changed. One that took over the cache entry of a name
@@ -2443,7 +2486,7 @@ const char *watched_path(dev_t dev, ino_t ino) {
 // signal_fd, and return that signal; SIGTERM if the events cannot be read
 int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
     char buffer[BUF_LEN] __attribute__((aligned(__alignof__(struct inotify_event))));
-    event_loop loop = {inotify_fd, config, 0, config->debounce_ms, 0, 0, 0, 0, NULL, NULL};
+    event_loop loop = {inotify_fd, config, 0, config->debounce_ms, 0, 0, 0, 0, NULL, NULL, 0, 0};
     events_config = config;
     int reported_failure = 0;
 
@@ -2531,7 +2574,15 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
             if (event->wd < 0) {
                 if (event->mask & IN_Q_OVERFLOW) {
                     fprintf(stderr, RED "+ inotify event queue overflowed; events lost, rescanning\n" RESET);
-                    rescan(&loop);
+                    printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET, "(lost events)",
+                           describe(IN_Q_OVERFLOW));
+                    // At most one walk a second, and one more after the last
+                    // overflow: a walk is the cost of the whole tree
+                    if (loop.last_rescan && loop.now - loop.last_rescan < RESCAN_MS) {
+                        loop.rescan_due = 1;
+                    } else {
+                        rescan(&loop);
+                    }
                 }
             } else {
                 dir_entry *dir = dir_find(config, event->wd);
@@ -2601,7 +2652,9 @@ void print_usage(void) {
            "                 to deny it then instead\n"
            "\n"
            "Diff:\n"
-           "  --diff         Show what changed in each file, from a private cache\n"
+           "  --diff         Show what changed in each file, from a private cache (a file\n"
+           "                 over 64 MiB, or past 256 MiB for all, keeps only its size\n"
+           "                 and modification time)\n"
            "  -l FILE        Also write the diffs to FILE (needs --diff)\n"
            "\n"
            "Other:\n"
