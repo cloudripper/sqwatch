@@ -23,6 +23,10 @@
 // looking for them is bounded too
 #define DIFF_MAX_EDITS 2000
 #define DIFF_MAX_STEPS 200000000L
+// At most this many lines, and bytes, of one diff are shown, and logged; the
+// rest are counted in a note
+#define DIFF_SHOW_LINES 500
+#define DIFF_SHOW_BYTES (1 << 20)
 
 // A file read whole into one buffer, each line ended by a NUL in place of its
 // newline. Line i starts at data + start[i]; start[count] is one past the

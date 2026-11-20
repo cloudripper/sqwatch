@@ -341,24 +341,62 @@ static int hunk_at_end(const diff_hunk *hunk, const file_lines *current,
   return hunk->cached_at == cached->count || hunk->current_at == current->count;
 }
 
+// What one shown or logged diff has used of DIFF_SHOW_LINES and
+// DIFF_SHOW_BYTES; the lines past either are counted, not written
+typedef struct {
+  int lines;
+  size_t bytes;
+  long long hidden;
+} show_cap;
+
+// Whether text may be written as one more line of the diff; if not, it is
+// counted as hidden
+static int cap_take(show_cap *cap, const char *text) {
+  size_t len = strlen(text) + 16;
+  if (cap->hidden || cap->lines >= DIFF_SHOW_LINES || cap->bytes + len > DIFF_SHOW_BYTES) {
+    cap->hidden++;
+    return 0;
+  }
+  cap->lines++;
+  cap->bytes += len;
+  return 1;
+}
+
+static void cap_note(FILE *fp, const show_cap *cap) {
+  if (cap->hidden) {
+    fprintf(fp, "... %lld more line%s not shown\n", cap->hidden, cap->hidden == 1 ? "" : "s");
+  }
+}
+
 void print_diff(const file_lines *current, const file_lines *cached, const diff_hunk *hunks,
                 int count, int verbose) {
   if (!verbose)
     return;
 
   int steps = 0;
+  show_cap cap = {0, 0, 0};
   for (int h = 0; h < count; h++) {
-    if (!hunk_at_end(&hunks[h], current, cached)) {
+    if (!cap.hidden && !hunk_at_end(&hunks[h], current, cached)) {
       printf("\n");
     }
     for (int j = hunks[h].cached_at; j < hunks[h].cached_at + hunks[h].removed; j++) {
       check_signals_every_256(&steps);
-      printf(RED "-%d: %s\n" RESET, j + 1, shown_text(line_at(cached, j)));
+      const char *text = shown_text(line_at(cached, j));
+      if (cap_take(&cap, text)) {
+        printf(RED "-%d: %s\n" RESET, j + 1, text);
+      }
     }
     for (int i = hunks[h].current_at; i < hunks[h].current_at + hunks[h].added; i++) {
       check_signals_every_256(&steps);
-      printf(GREEN "+%d: %s\n" RESET, i + 1, shown_text(line_at(current, i)));
+      const char *text = shown_text(line_at(current, i));
+      if (cap_take(&cap, text)) {
+        printf(GREEN "+%d: %s\n" RESET, i + 1, text);
+      }
     }
+  }
+  if (cap.hidden) {
+    printf(DARK_GREY);
+    cap_note(stdout, &cap);
   }
   printf(RESET "\n");
 }
@@ -401,20 +439,28 @@ void log_changes(const char *log_file, const char *path, const char *event_type,
 
   int in_change_block = 0;
   int steps = 0;
+  show_cap cap = {0, 0, 0};
   for (int h = 0; h < count; h++) {
-    if (hunk_at_end(&hunks[h], current, cached) || !in_change_block) {
+    if (!cap.hidden && (hunk_at_end(&hunks[h], current, cached) || !in_change_block)) {
       fprintf(log_fp, "\n");
     }
     in_change_block = 1;
     for (int j = hunks[h].cached_at; j < hunks[h].cached_at + hunks[h].removed; j++) {
       check_signals_every_256(&steps);
-      fprintf(log_fp, "-%d: %s\n", j + 1, shown_text(line_at(cached, j)));
+      const char *text = shown_text(line_at(cached, j));
+      if (cap_take(&cap, text)) {
+        fprintf(log_fp, "-%d: %s\n", j + 1, text);
+      }
     }
     for (int i = hunks[h].current_at; i < hunks[h].current_at + hunks[h].added; i++) {
       check_signals_every_256(&steps);
-      fprintf(log_fp, "+%d: %s\n", i + 1, shown_text(line_at(current, i)));
+      const char *text = shown_text(line_at(current, i));
+      if (cap_take(&cap, text)) {
+        fprintf(log_fp, "+%d: %s\n", i + 1, text);
+      }
     }
   }
+  cap_note(log_fp, &cap);
 
   fprintf(log_fp, "=== End Text Diff ===\n\n");
   log_end();

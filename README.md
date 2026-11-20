@@ -107,7 +107,7 @@ Intercept (fanotify; needs the `CAP_SYS_ADMIN` capability, that is, root):
 - `-T TIMEOUT`: Time the command has to decide, a decimal number of seconds above 0 (default: 5). When it runs out, the command's process group is killed and the access allowed; `deny` or `SECONDS:deny` denies it instead (fails closed)
 
 Diff:
-- `--diff`: Show what changed in each file, from a private cache. A file over 64 MiB is not copied, nor one that would take all the copies together over 256 MiB: only its size and modification time are kept, and a change to it is reported without a diff (a notice says when that starts)
+- `--diff`: Show what changed in each file, from a private cache. A file over 64 MiB is not copied, nor one that would take all the copies together over 256 MiB: only its size and modification time are kept, and a change to it is reported without a diff (a notice says when that starts). Each diff shown, and logged, stops after 500 lines or 1 MiB, with a note of how many lines were left out
 - `-l FILE`: Also write the diffs to FILE (needs `--diff`)
 
 Other:
