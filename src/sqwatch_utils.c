@@ -77,16 +77,130 @@ void print_event_type(struct inotify_event *event) {
   fflush(stdout);  // Ensure partial line is displayed
 }
 
-// Copy a path for display, replacing control characters so a file name
-// cannot inject terminal escapes or extra lines into the output
-const char *printable(const char *path, char *buf, size_t size) {
-    size_t i = 0;
-    for (; path[i] != '\0' && i + 1 < size; i++) {
-        unsigned char c = (unsigned char)path[i];
-        buf[i] = (c < 0x20 || c == 0x7f) ? '?' : (char)c;
+// Whether the valid n-byte UTF-8 sequence at p is a character that changes
+// how text around it is shown without being visible itself: the bidirectional
+// marks, embeddings, overrides and isolates (U+061C, U+200E, U+200F, U+202A to
+// U+202E, U+2066 to U+2069), or a line or paragraph separator (U+2028,
+// U+2029), which some readers take as the end of a line
+static int is_format_char(const unsigned char *p, size_t n) {
+    if (n == 2) {
+        return p[0] == 0xd8 && p[1] == 0x9c;
     }
-    buf[i] = '\0';
+    if (n != 3 || p[0] != 0xe2) {
+        return 0;
+    }
+    if (p[1] == 0x80) {
+        return p[2] == 0x8e || p[2] == 0x8f || (p[2] >= 0xa8 && p[2] <= 0xae);
+    }
+    return p[1] == 0x81 && p[2] >= 0xa6 && p[2] <= 0xa9;
+}
+
+// Copy s into buf, escaped as escape() describes, stopping before the first
+// character or escape that would not fit in limit bytes with the NUL after
+// it. Returns the length written; *complete says whether all of s fitted
+static size_t escape_into(const char *s, int allow_tab, char *buf, size_t limit,
+                          int *complete) {
+    static const char hex[] = "0123456789abcdef";
+    const unsigned char *p = (const unsigned char *)s;
+    size_t o = 0;
+    *complete = 1;
+    while (*p) {
+        unsigned char c = *p;
+        size_t n = 1;
+        int ok;
+        if (c < 0x80) {
+            ok = (c >= 0x20 && c != 0x7f && c != '\\') || (allow_tab && c == '\t') ||
+                 (allow_tab && c == '\r' && p[1] == '\0');
+        } else if (c >= 0xc2 && c <= 0xdf) {
+            n = 2;
+            ok = (p[1] & 0xc0) == 0x80 && !(c == 0xc2 && p[1] < 0xa0);
+        } else if (c >= 0xe0 && c <= 0xef) {
+            n = 3;
+            ok = (p[1] & 0xc0) == 0x80 && (p[2] & 0xc0) == 0x80 &&
+                 !(c == 0xe0 && p[1] < 0xa0) && !(c == 0xed && p[1] >= 0xa0);
+        } else if (c >= 0xf0 && c <= 0xf4) {
+            n = 4;
+            ok = (p[1] & 0xc0) == 0x80 && (p[2] & 0xc0) == 0x80 && (p[3] & 0xc0) == 0x80 &&
+                 !(c == 0xf0 && p[1] < 0x90) && !(c == 0xf4 && p[1] >= 0x90);
+        } else {
+            ok = 0;
+        }
+        if (ok && is_format_char(p, n)) {
+            // Every byte of it is written as \xHH: the lead byte here, the
+            // others in turn, as continuation bytes on their own are invalid
+            ok = 0;
+        }
+        if (!ok) {
+            n = 1;
+        }
+        if (o + (ok ? n : 4) >= limit) {
+            *complete = 0;
+            break;
+        }
+        if (ok) {
+            memcpy(buf + o, p, n);
+            o += n;
+        } else {
+            buf[o++] = '\\';
+            buf[o++] = 'x';
+            buf[o++] = hex[c >> 4];
+            buf[o++] = hex[c & 0xf];
+        }
+        p += n;
+    }
+    buf[o] = '\0';
+    return o;
+}
+
+// Copy s for display with every byte that could act on a terminal, start a
+// line of its own or be mistaken for something else written as \xHH: C0
+// controls (a tab too, unless allow_tab), DEL, C1 controls whether UTF-8
+// encoded (c2 80 to c2 9f) or raw, every byte that is not part of valid UTF-8,
+// the invisible bidirectional and separator characters (see is_format_char())
+// and the backslash itself, so that a literal "\x1b" in a name cannot pass for
+// an escape. allow_tab is set for a line of a file's content: there a tab is
+// kept, and so is a carriage return that ends the line (a CRLF file). Valid
+// UTF-8 text is kept as it is. A copy that does not fit in size is cut short,
+// never in the middle of a character or an escape, and ends in "..."
+static const char *escape(const char *s, int allow_tab, char *buf, size_t size) {
+    int complete;
+    if (size == 0) {
+        return "";
+    }
+    size_t o = escape_into(s, allow_tab, buf, size, &complete);
+    if (!complete && size > 3) {
+        o = escape_into(s, allow_tab, buf, size - 3, &complete);
+        memcpy(buf + o, "...", 4);
+    }
     return buf;
+}
+
+// A file name or path for display; see escape(). buf should hold
+// 4 * PATH_MAX + 1 bytes, so that no path is cut
+const char *printable(const char *path, char *buf, size_t size) {
+    return escape(path, 0, buf, size);
+}
+
+// escape() into one of a few static buffers, to use straight in a printf();
+// up to SHOWN_SLOTS results are valid at once
+#define SHOWN_SLOTS 4
+#define SHOWN_SIZE (4 * PATH_MAX + 1)
+static const char *shown_slot(const char *s, int allow_tab) {
+    static char slots[SHOWN_SLOTS][SHOWN_SIZE];
+    static int next = 0;
+    char *buf = slots[next];
+    next = (next + 1) % SHOWN_SLOTS;
+    return escape(s, allow_tab, buf, SHOWN_SIZE);
+}
+
+// A file name or path for display
+const char *shown_name(const char *name) {
+    return shown_slot(name, 0);
+}
+
+// A line of a watched file's content for display or the log: tabs are kept
+const char *shown_text(const char *text) {
+    return shown_slot(text, 1);
 }
 
 // Write the path that names whatever fd has open. Used through this path, a
@@ -220,7 +334,7 @@ static void watch_file(int inotify_fd, int parent_fd, const char *name, const ch
                                   &config->cached_paths[wd], config->verbose);
         }
         if (config->verbose) {
-            printf(CYAN "+ Watch set for file %s\n" RESET, path);
+            printf(CYAN "+ Watch set for file %s\n" RESET, shown_name(path));
         }
     }
     if (fd != -1) {
@@ -246,7 +360,7 @@ static void watch_dir(int inotify_fd, int dir_fd, const char *path, int root, ui
                 config->dir_watches[d].root = root;
             }
             if (config->verbose) {
-                printf(CYAN "+ Watch set for directory %s\n" RESET, path);
+                printf(CYAN "+ Watch set for directory %s\n" RESET, shown_name(path));
             }
             return;
         }
@@ -268,7 +382,7 @@ static void watch_dir(int inotify_fd, int dir_fd, const char *path, int root, ui
     config->dir_watch_count++;
 
     if (config->verbose) {
-        printf(CYAN "+ Watch set for directory %s\n" RESET, path);
+        printf(CYAN "+ Watch set for directory %s\n" RESET, shown_name(path));
     }
 }
 
@@ -331,13 +445,14 @@ static int read_names(int inotify_fd, int fd, char *path, int root, uint32_t fla
         if (type != DT_DIR) {
             if (snprintf(path + len, PATH_MAX - len, "/%s", name) >= (int)(PATH_MAX - len)) {
                 path[len] = '\0';
-                fprintf(stderr, RED "+ Path too long, skipping %s/%s\n" RESET, path, name);
+                fprintf(stderr, RED "+ Path too long, skipping %s/%s\n" RESET, shown_name(path),
+                        shown_name(name));
                 continue;
             }
             struct stat st;
             if (type == DT_UNKNOWN) {
                 if (fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == -1) {
-                    fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, path,
+                    fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, shown_name(path),
                             strerror(errno));
                     path[len] = '\0';
                     continue;
@@ -346,7 +461,7 @@ static int read_names(int inotify_fd, int fd, char *path, int root, uint32_t fla
                        S_ISLNK(st.st_mode) ? DT_LNK : DT_UNKNOWN;
             }
             if (type == DT_LNK && config->verbose) {
-                printf(DARK_GREY "+ Skipping symlink %s\n" RESET, path);
+                printf(DARK_GREY "+ Skipping symlink %s\n" RESET, shown_name(path));
             } else if (type == DT_REG) {
                 watch_file(inotify_fd, fd, name, path, root, flags, config, at_runtime);
             }
@@ -371,7 +486,7 @@ static int read_names(int inotify_fd, int fd, char *path, int root, uint32_t fla
         level->names[level->count++] = copy;
     }
     if (entry) {
-        fprintf(stderr, RED "+ Out of memory, not watching all of %s\n" RESET, path);
+        fprintf(stderr, RED "+ Out of memory, not watching all of %s\n" RESET, shown_name(path));
     }
     closedir(dir);
     return 0;
@@ -386,14 +501,16 @@ static int enter_dir(int inotify_fd, int fd, char *path, int root, uint32_t flag
                      size_t *depth, size_t *size) {
     struct stat st;
     if (fstat(fd, &st) != 0) {
-        fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, path, strerror(errno));
+        fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, shown_name(path),
+                strerror(errno));
         return 0;
     }
     if (*depth == *size) {
         size_t new_size = *size ? *size * 2 : 16;
         walk_level *grown = realloc(*levels, new_size * sizeof(*grown));
         if (!grown) {
-            fprintf(stderr, RED "+ Out of memory, not watching %s\n" RESET, path);
+            fprintf(stderr, RED "+ Out of memory, not watching %s\n" RESET,
+                    shown_name(path));
             return 0;
         }
         *levels = grown;
@@ -403,7 +520,8 @@ static int enter_dir(int inotify_fd, int fd, char *path, int root, uint32_t flag
     walk_level *level = &(*levels)[*depth];
     *level = (walk_level){NULL, 0, 0, st.st_dev, st.st_ino, strlen(path)};
     if (read_names(inotify_fd, fd, path, root, flags, config, at_runtime, level) != 0) {
-        fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, path, strerror(errno));
+        fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, shown_name(path),
+                strerror(errno));
         return 0;
     }
     (*depth)++;
@@ -438,7 +556,7 @@ static int climb(int child_fd, const watch_root *top, char *path, walk_level *le
             fd = -1;
         }
         fprintf(stderr, RED "+ %s was moved or replaced, not watching the rest of it\n" RESET,
-                path);
+                shown_name(path));
         free_level(level);
         (*depth)--;
     }
@@ -466,13 +584,13 @@ static void add_watches_walk(int inotify_fd, int parent_fd, const char *name, co
     const watch_root *top = &config->roots[root];
     struct stat path_stat;
     if (fstatat(parent_fd, name, &path_stat, AT_SYMLINK_NOFOLLOW) == -1) {
-        fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, path, strerror(errno));
+        fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, shown_name(path), strerror(errno));
         return;
     }
 
     if (S_ISLNK(path_stat.st_mode)) {
         if (config->verbose) {
-            printf(DARK_GREY "+ Skipping symlink %s\n" RESET, path);
+            printf(DARK_GREY "+ Skipping symlink %s\n" RESET, shown_name(path));
         }
         return;
     }
@@ -490,12 +608,13 @@ static void add_watches_walk(int inotify_fd, int parent_fd, const char *name, co
 
     char dir_path[PATH_MAX];
     if (snprintf(dir_path, sizeof(dir_path), "%s", path) >= (int)sizeof(dir_path)) {
-        fprintf(stderr, RED "+ Path too long, skipping %s\n" RESET, path);
+        fprintf(stderr, RED "+ Path too long, skipping %s\n" RESET, shown_name(path));
         return;
     }
     int cur = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (cur == -1) {
-        fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, path, strerror(errno));
+        fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, shown_name(path),
+                strerror(errno));
         return;
     }
 
@@ -527,23 +646,26 @@ static void add_watches_walk(int inotify_fd, int parent_fd, const char *name, co
         if (snprintf(dir_path + len, sizeof(dir_path) - len, "/%s", entry) >=
             (int)(sizeof(dir_path) - len)) {
             dir_path[len] = '\0';
-            fprintf(stderr, RED "+ Path too long, skipping %s/%s\n" RESET, dir_path, entry);
+            fprintf(stderr, RED "+ Path too long, skipping %s/%s\n" RESET,
+                    shown_name(dir_path), shown_name(entry));
             continue;
         }
 
         struct stat st;
         if (fstatat(cur, entry, &st, AT_SYMLINK_NOFOLLOW) == -1) {
-            fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, dir_path, strerror(errno));
+            fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, shown_name(dir_path),
+                    strerror(errno));
         } else if (S_ISLNK(st.st_mode)) {
             if (config->verbose) {
-                printf(DARK_GREY "+ Skipping symlink %s\n" RESET, dir_path);
+                printf(DARK_GREY "+ Skipping symlink %s\n" RESET, shown_name(dir_path));
             }
         } else if (S_ISREG(st.st_mode)) {
             watch_file(inotify_fd, cur, entry, dir_path, root, flags, config, at_runtime);
         } else if (S_ISDIR(st.st_mode)) {
             int fd = openat(cur, entry, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
             if (fd == -1) {
-                fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, dir_path,
+                fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET,
+                        shown_name(dir_path),
                         strerror(errno));
             } else if (enter_dir(inotify_fd, fd, dir_path, root, flags, config, at_runtime,
                                  &levels, &depth, &size)) {
@@ -566,7 +688,7 @@ void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags,
                            sqwatch_config *config) {
     struct stat path_stat;
     if (stat(path, &path_stat) == -1) {
-        fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, path, strerror(errno));
+        fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, shown_name(path), strerror(errno));
         return;
     }
     if (config->root_count >= MAX_PATHS) {
@@ -614,9 +736,8 @@ void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags,
     }
 
     if (error) {
-        char shown[PATH_MAX];
         fprintf(stderr, RED "+ Failed to open %s: %s\n" RESET,
-                printable(path, shown, sizeof(shown)), error);
+                shown_name(path), error);
         if (root->fd != -1) {
             close(root->fd);
         }
@@ -640,16 +761,15 @@ void cache_watched_files(sqwatch_config *config) {
 
         const watch_root *root = &config->roots[config->watch_roots[i]];
         struct stat st;
-        char shown[PATH_MAX];
         int fd = open_beneath(root->fd, rel_path(root, config->watch_paths[i]), O_PATH);
         if (fd == -1) {
             fprintf(stderr, RED "+ Not caching %s: %s\n" RESET,
-                    printable(config->watch_paths[i], shown, sizeof(shown)), strerror(errno));
+                    shown_name(config->watch_paths[i]), strerror(errno));
             continue;
         }
         if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
             fprintf(stderr, RED "+ Not caching %s: no longer a regular file\n" RESET,
-                    printable(config->watch_paths[i], shown, sizeof(shown)));
+                    shown_name(config->watch_paths[i]));
             close(fd);
             continue;
         }
@@ -665,7 +785,7 @@ void cache_watched_files(sqwatch_config *config) {
             copy_file(fd_path(fd, io_path, sizeof(io_path)), config->cached_paths[i],
                       config->watch_paths[i]) == 0 && config->verbose) {
             printf(DARK_GREY "+ Cached [%d]: %s\n" RESET, i,
-                   printable(config->watch_paths[i], shown, sizeof(shown)));
+                   shown_name(config->watch_paths[i]));
         }
         close(fd);
     }
@@ -820,7 +940,7 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                 if (dir_fd != -1 && fstatat(dir_fd, event->name, &path_stat, AT_SYMLINK_NOFOLLOW) == 0) {
                     if (S_ISLNK(path_stat.st_mode)) {
                         if (config.verbose) {
-                            printf(DARK_GREY "+ Skipping symlink %s\n" RESET, full_path);
+                            printf(DARK_GREY "+ Skipping symlink %s\n" RESET, shown_name(full_path));
                         }
                     } else if (S_ISREG(path_stat.st_mode)) {
                         // New file created - add watch
@@ -843,7 +963,7 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                             }
 
                             if (config.verbose) {
-                                printf(CYAN "+ Added watch for new file: %s\n" RESET, full_path);
+                                printf(CYAN "+ Added watch for new file: %s\n" RESET, shown_name(full_path));
                             }
                         }
                         if (file_fd != -1) {
@@ -860,9 +980,8 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                     // swallow a write to the new file that follows
                     if ((config.flags & IN_CREATE) && now - last_create >= config.debounce_t) {
                         stop_command();
-                        char shown[PATH_MAX];
                         printf(CYAN "+ Trigger on %s: [ Created ]\n" RESET,
-                            printable(full_path, shown, sizeof(shown)));
+                            shown_name(full_path));
                         start_command(config.command);
                         last_create = now;
                     }
@@ -908,7 +1027,7 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                         close(file_fd);
                     }
                     if (config.verbose) {
-                        printf(DARK_GREY "+ File no longer exists: %s\n" RESET, full_path);
+                        printf(DARK_GREY "+ File no longer exists: %s\n" RESET, shown_name(full_path));
                     }
                     // Release the kernel watch too, or it stays for as long as
                     // the file lives elsewhere. After IN_IGNORED it is gone
@@ -922,7 +1041,7 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                     // Clean up cache path
                     if (config.cached_paths[event->wd]) {
                         if (config.verbose) {
-                            printf(DARK_GREY "+ Removing cache for: %s\n" RESET, full_path);
+                            printf(DARK_GREY "+ Removing cache for: %s\n" RESET, shown_name(full_path));
                         }
                         unlink_cache_file(config.cached_paths[event->wd]); // Remove cache file
                         free(config.cached_paths[event->wd]);
@@ -947,7 +1066,7 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                         }
                         config.watch_paths[new_wd] = strdup(full_path);
                         if (!config.watch_paths[new_wd]) {
-                            fprintf(stderr, RED "+ Out of memory tracking %s\n" RESET, full_path);
+                            fprintf(stderr, RED "+ Out of memory tracking %s\n" RESET, shown_name(full_path));
                             close(file_fd);
                             i += EVENT_SIZE + event->len;
                             continue;
@@ -969,7 +1088,7 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                         }
 
                         if (config.verbose) {
-                            printf(DARK_GREY "+ Reapplied watch for %s\n" RESET, full_path);
+                            printf(DARK_GREY "+ Reapplied watch for %s\n" RESET, shown_name(full_path));
                         }
                         event_wd = new_wd;
                     }
@@ -997,9 +1116,8 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                     stop_command();
 
                     if (!(event->mask & IN_IGNORED)) {
-                        char shown[PATH_MAX];
                         printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET,
-                            printable(config.watch_paths[event_wd], shown, sizeof(shown)),
+                            shown_name(config.watch_paths[event_wd]),
                             event_desc);
                     }
 

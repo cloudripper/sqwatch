@@ -64,13 +64,13 @@ static file_lines read_file_lines(const char *filename, const char *io_path, int
   }
   if (!file && errno == EWOULDBLOCK) {
     fprintf(stderr, RED "+ Skipping %s this time: another process holds a lease on it\n" RESET,
-            filename);
+            shown_name(filename));
     fl.count = -1;
     return fl;
   }
   if (!file) {
     fprintf(stderr, RED "Failed to open %s after %d retries: %s\n" RESET,
-            filename, retry_count, strerror(errno));
+            shown_name(filename), retry_count, strerror(errno));
     return fl;
   }
 
@@ -80,7 +80,7 @@ static file_lines read_file_lines(const char *filename, const char *io_path, int
   int fd = fileno(file);
   while (retry_count < 5) { // Try up to 5 times
     if (fstat(fd, &st) < 0) {
-      fprintf(stderr, RED "Failed to stat %s: %s\n" RESET, filename,
+      fprintf(stderr, RED "Failed to stat %s: %s\n" RESET, shown_name(filename),
               strerror(errno));
       fclose(file);
       return fl;
@@ -96,7 +96,7 @@ static file_lines read_file_lines(const char *filename, const char *io_path, int
   }
 
   if (st.st_size == 0) {
-    fprintf(stderr, DARK_GREY "File %s is empty after %d attempts\n" RESET, filename,
+    fprintf(stderr, DARK_GREY "File %s is empty after %d attempts\n" RESET, shown_name(filename),
             retry_count);
     fclose(file);
     return fl;
@@ -112,13 +112,42 @@ static file_lines read_file_lines(const char *filename, const char *io_path, int
     return fl;
   }
 
-  // Read lines using fgets
-  while (fgets(line, sizeof(line), file)) {
+  // Read lines using fgets. A line longer than the buffer comes in pieces;
+  // a piece that would end inside a UTF-8 character ends before it instead,
+  // and the bytes of that character start the next piece (tail), so that the
+  // character is shown whole rather than as escapes
+  char tail[4];
+  size_t carry = 0;
+  for (;;) {
+    memcpy(line, tail, carry);
+    char *got = fgets(line + carry, (int)(sizeof(line) - carry), file);
+    if (!got) {
+      if (carry == 0) {
+        break;
+      }
+      line[carry] = '\0';  // the file ends with the carried bytes
+    }
+    carry = 0;
     if ((fl.count & 1023) == 1023) {
       stop_if_signalled();
     }
-    // Remove trailing newline if present
     size_t len = strlen(line);
+    if (got && len == sizeof(line) - 1 && line[len - 1] != '\n') {
+      size_t start = len;
+      while (start > 0 && len - start < 3 && ((unsigned char)line[start - 1] & 0xc0) == 0x80) {
+        start--;
+      }
+      unsigned char lead = start > 0 ? (unsigned char)line[start - 1] : 0;
+      size_t need = lead >= 0xf0 && lead <= 0xf4 ? 4 : lead >= 0xe0 && lead <= 0xef ? 3 :
+                    lead >= 0xc2 && lead <= 0xdf ? 2 : 0;
+      if (need > len - (start - 1)) {
+        carry = len - (start - 1);
+        memcpy(tail, line + start - 1, carry);
+        len = start - 1;
+        line[len] = '\0';
+      }
+    }
+    // Remove trailing newline if present
     if (len > 0 && line[len - 1] == '\n') {
       line[len - 1] = '\0';
     }
@@ -143,6 +172,9 @@ static file_lines read_file_lines(const char *filename, const char *io_path, int
       return (file_lines){NULL, 0};
     }
     fl.count++;
+    if (!got) {
+      break;
+    }
   }
 
   fclose(file);
@@ -164,7 +196,7 @@ void print_diff(file_lines *current, file_lines *cached, int verbose) {
     if (strcmp(current->lines[i], cached->lines[j]) == 0) {
       // Lines match - show context if needed
       if (in_change_block && lines_since_change < context_lines) {
-        printf("  %d: %s\n", i + 1, current->lines[i]);
+        printf("  %d: %s\n", i + 1, shown_text(current->lines[i]));
       }
       lines_since_change++;
       if (lines_since_change >= context_lines) {
@@ -184,8 +216,8 @@ void print_diff(file_lines *current, file_lines *cached, int verbose) {
         }
         in_change_block = 1;
         lines_since_change = 0;
-        printf(RED "-%d: %s\n" RESET, j + 1, cached->lines[j]);
-        printf(GREEN "+%d: %s\n" RESET, i + 1, current->lines[i]);
+        printf(RED "-%d: %s\n" RESET, j + 1, shown_text(cached->lines[j]));
+        printf(GREEN "+%d: %s\n" RESET, i + 1, shown_text(current->lines[i]));
         i++;
         j++;
         continue;
@@ -225,12 +257,12 @@ void print_diff(file_lines *current, file_lines *cached, int verbose) {
 
       // Print removed lines
       while (j < next_match_j) {
-        printf(RED "-%d: %s\n" RESET, j + 1, cached->lines[j]);
+        printf(RED "-%d: %s\n" RESET, j + 1, shown_text(cached->lines[j]));
         j++;
       }
       // Print added lines
       while (i < next_match_i) {
-        printf(GREEN "+%d: %s\n" RESET, i + 1, current->lines[i]);
+        printf(GREEN "+%d: %s\n" RESET, i + 1, shown_text(current->lines[i]));
         i++;
       }
 
@@ -245,12 +277,12 @@ void print_diff(file_lines *current, file_lines *cached, int verbose) {
   // Print any remaining lines
   while (i < current->count) {
     check_signals_every_256(&steps);
-    printf(GREEN "+%d: %s\n" RESET, i + 1, current->lines[i]);
+    printf(GREEN "+%d: %s\n" RESET, i + 1, shown_text(current->lines[i]));
     i++;
   }
   while (j < cached->count) {
     check_signals_every_256(&steps);
-    printf(RED "-%d: %s\n" RESET, j + 1, cached->lines[j]);
+    printf(RED "-%d: %s\n" RESET, j + 1, shown_text(cached->lines[j]));
     j++;
   }
   printf(RESET "\n");
@@ -276,7 +308,7 @@ void log_changes(const char *log_file, const char *path, const char *event_type,
 
   fprintf(log_fp, "\n=== Text File Diff ===\n");
   fprintf(log_fp, "Time: %s\n", timestamp);
-  fprintf(log_fp, "File: %s\n", path);
+  fprintf(log_fp, "File: %s\n", shown_name(path));
   fprintf(log_fp, "Event: %s\n", event_type);
 
   int i = 0, j = 0;
@@ -318,11 +350,11 @@ void log_changes(const char *log_file, const char *path, const char *event_type,
       in_change_block = 1;
 
       while (j < next_match_j) {
-        fprintf(log_fp, "-%d: %s\n", j + 1, cached->lines[j]);
+        fprintf(log_fp, "-%d: %s\n", j + 1, shown_text(cached->lines[j]));
         j++;
       }
       while (i < next_match_i) {
-        fprintf(log_fp, "+%d: %s\n", i + 1, current->lines[i]);
+        fprintf(log_fp, "+%d: %s\n", i + 1, shown_text(current->lines[i]));
         i++;
       }
 
@@ -340,12 +372,12 @@ void log_changes(const char *log_file, const char *path, const char *event_type,
 
   while (i < current->count) {
     check_signals_every_256(&steps);
-    fprintf(log_fp, "+%d: %s\n", i + 1, current->lines[i]);
+    fprintf(log_fp, "+%d: %s\n", i + 1, shown_text(current->lines[i]));
     i++;
   }
   while (j < cached->count) {
     check_signals_every_256(&steps);
-    fprintf(log_fp, "-%d: %s\n", j + 1, cached->lines[j]);
+    fprintf(log_fp, "-%d: %s\n", j + 1, shown_text(cached->lines[j]));
     j++;
   }
 
@@ -365,7 +397,7 @@ int is_binary_file(const char *filename, const char *io_path) {
       return -2; // Leased by another process: run_diff() says so
     }
     if (!file) {
-      fprintf(stderr, RED "Cannot open %s: %s\n" RESET, filename,
+      fprintf(stderr, RED "Cannot open %s: %s\n" RESET, shown_name(filename),
               strerror(errno));
       return -1;
     }
@@ -387,7 +419,7 @@ int is_binary_file(const char *filename, const char *io_path) {
     retry_count++;
   }
 
-  fprintf(stderr, RED "Failed to read %s after %d attempts\n" RESET, filename,
+  fprintf(stderr, RED "Failed to read %s after %d attempts\n" RESET, shown_name(filename),
           max_retries);
   return -1; // Failed to read file after retries
 }
@@ -395,29 +427,27 @@ int is_binary_file(const char *filename, const char *io_path) {
 // cached_file_path is the watched file's own cache entry
 void run_diff(const char *path, const char *io_path, const char *cached_file_path,
               const char *event_type, int verbose, const char *log_file) {
-  char shown[PATH_MAX];
-
   // Check if file is binary
   int bin_check = is_binary_file(path, io_path);
   if (bin_check > 0) {
     if (verbose) {
-      printf(DARK_GREY "Binary file detected: %s\n" RESET, path);
+      printf(DARK_GREY "Binary file detected: %s\n" RESET, shown_name(path));
       print_bin_diff(path, io_path, cached_file_path, log_file);
     }
 
     // Still update the cache for binary files
     if (copy_file(io_path, cached_file_path, path) != 0) {
       fprintf(stderr, RED "Failed to update the cache of %s\n" RESET,
-              printable(path, shown, sizeof(shown)));
+              shown_name(path));
     }
 
     return;
   } else if (bin_check == -2) {
     fprintf(stderr, RED "+ Skipping %s this time: another process holds a lease on it\n" RESET,
-            path);
+            shown_name(path));
     return;
   } else if (bin_check < 0) {
-    fprintf(stderr, RED "Failed to read %s.\n" RESET, path);
+    fprintf(stderr, RED "Failed to read %s.\n" RESET, shown_name(path));
     return;
   }
 
@@ -450,7 +480,7 @@ void run_diff(const char *path, const char *io_path, const char *cached_file_pat
     // Update cache regardless of which case
     if (copy_file(io_path, cached_file_path, path) != 0) {
       fprintf(stderr, RED "Failed to update the cache of %s\n" RESET,
-              printable(path, shown, sizeof(shown)));
+              shown_name(path));
     }
   }
 
@@ -475,7 +505,7 @@ void run_diff(const char *path, const char *io_path, const char *cached_file_pat
       // Update the cache file with the current content
       if (copy_file(io_path, cached_file_path, path) != 0) {
         fprintf(stderr, RED "Failed to update the cache of %s\n" RESET,
-                printable(path, shown, sizeof(shown)));
+                shown_name(path));
       }
     }
   }
@@ -577,7 +607,7 @@ void log_bin_diff(const char *log_file, const char *path,
 
   fprintf(log_fp, "\n=== Binary File Diff ===\n");
   fprintf(log_fp, "Time: %s\n", timestamp);
-  fprintf(log_fp, "File: %s\n", path);
+  fprintf(log_fp, "File: %s\n", shown_name(path));
   fprintf(log_fp, "Offset: 0x%08zx\n",
           diffs[0].offset & ~0xF); // Base offset of first change
 

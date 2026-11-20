@@ -35,9 +35,9 @@ static void cleanup(int signo) {
   // made it
   if (cache_dir && cache_dir_fd >= 0) {
     if (cache_dir_owned) {
-      printf(RED "+ Wiping cache directory: %s\n" RESET, cache_dir);
+      printf(RED "+ Wiping cache directory: %s\n" RESET, shown_name(cache_dir));
     } else {
-      printf(RED "+ Removing this run's cache entries from %s\n" RESET, cache_dir);
+      printf(RED "+ Removing this run's cache entries from %s\n" RESET, shown_name(cache_dir));
     }
     remove_caches();
   }
@@ -148,7 +148,7 @@ int main(int argc, char *argv[]) {
       {
         struct stat statbuf;
         if (stat(optarg, &statbuf) != 0 || !S_ISDIR(statbuf.st_mode)) {
-          fprintf(stderr, "Error: %s is not a valid directory.\n", optarg);
+          fprintf(stderr, "Error: %s is not a valid directory.\n", shown_name(optarg));
           exit(EXIT_FAILURE);
         }
       }
@@ -164,7 +164,7 @@ int main(int argc, char *argv[]) {
       {
         struct stat statbuf;
         if (stat(optarg, &statbuf) != 0 || !S_ISREG(statbuf.st_mode)) {
-          fprintf(stderr, "Error: %s is not a valid file.\n", optarg);
+          fprintf(stderr, "Error: %s is not a valid file.\n", shown_name(optarg));
           exit(EXIT_FAILURE);
         }
       }
@@ -198,7 +198,7 @@ int main(int argc, char *argv[]) {
         flags = IN_ATTRIB;
         printf(GREEN "+ Monitoring attribute events enabled\n" RESET);
       } else {
-        fprintf(stderr, "Invalid query option: %s\n", optarg);
+        fprintf(stderr, "Invalid query option: %s\n", shown_name(optarg));
         print_usage();
         exit(EXIT_FAILURE);
       }
@@ -220,7 +220,7 @@ int main(int argc, char *argv[]) {
           exit(EXIT_FAILURE);
         }
         printf(DARK_GREY "+ Cache set. Using SQWATCH_CACHE_DIR: %s\n" RESET,
-               cache_dir);
+               shown_name(cache_dir));
       } else {
         // The XDG spec says to ignore an empty or relative XDG_CACHE_HOME
         const char *xdg_cache_home = getenv("XDG_CACHE_HOME");
@@ -234,7 +234,7 @@ int main(int argc, char *argv[]) {
             printf(
                 DARK_GREY
                 "+ Cache set. Using XDG_CACHE_HOME: %s/.cache/sqwatch\n" RESET,
-                xdg_cache_home);
+                shown_name(xdg_cache_home));
           }
         } else {
           if (asprintf(&cache_dir, "%s/sqwatch", xdg_cache_home) < 0) {
@@ -243,7 +243,7 @@ int main(int argc, char *argv[]) {
           }
           printf(DARK_GREY
                  "+ Cache set.Using default cache directory: %s\n" RESET,
-                 cache_dir);
+                 shown_name(cache_dir));
         }
       }
       break;
@@ -271,8 +271,7 @@ int main(int argc, char *argv[]) {
     if (open_log_file(log_file) != 0) {
       exit(EXIT_FAILURE);
     }
-    char shown[PATH_MAX];
-    printf(DARK_GREY "+ Logging to %s\n" RESET, printable(log_file, shown, sizeof(shown)));
+    printf(DARK_GREY "+ Logging to %s\n" RESET, shown_name(log_file));
   }
 
   config.debounce_t = debounce_t;
@@ -300,7 +299,7 @@ int main(int argc, char *argv[]) {
     } else {
       // Diffs would read and write files under that path: do not diff at all
       config.diff_enabled = 0;
-      fprintf(stderr, RED "+ Diff disabled: cache directory %s cannot be used\n" RESET, cache_dir);
+      fprintf(stderr, RED "+ Diff disabled: cache directory %s cannot be used\n" RESET, shown_name(cache_dir));
     }
   }
 

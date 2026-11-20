@@ -66,6 +66,8 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config);
 void print_usage(void);
 void stop_if_signalled(void);
 const char *printable(const char *path, char *buf, size_t size);
+const char *shown_name(const char *name);
+const char *shown_text(const char *text);
 
 
 #endif // SQWATCH_H

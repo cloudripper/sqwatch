@@ -124,13 +124,12 @@ int open_watched_file(const char *io_path) {
 // of a copy is never read as the file's
 int copy_file(const char *src, const char *dest, const char *shown_path) {
   struct stat statbuf;
-  char shown[PATH_MAX];
 
   // Check if the destination is a directory
   if (fstatat(cache_dir_fd, cache_name(dest), &statbuf, AT_SYMLINK_NOFOLLOW) == 0 &&
       S_ISDIR(statbuf.st_mode)) {
     fprintf(stderr, "Failed to open the cache of %s: it is a directory\n",
-            printable(shown_path, shown, sizeof(shown)));
+            shown_name(shown_path));
     return -1;
   }
 
@@ -138,7 +137,7 @@ int copy_file(const char *src, const char *dest, const char *shown_path) {
   if (src_fd < 0) {
     if (errno == EWOULDBLOCK) {
       fprintf(stderr, RED "+ Not updating the cache of %s this time: another process holds a lease on it\n" RESET,
-              printable(shown_path, shown, sizeof(shown)));
+              shown_name(shown_path));
     } else {
       perror("Failed to open source file");
     }
@@ -434,15 +433,13 @@ static void empty_directory(int dir_fd) {
 
 // Say why the path given for what ("cache directory", "log file") is not used
 static int refuse_path(const char *what, const char *path, const char *where, const char *reason) {
-  char shown[PATH_MAX];
-  char shown_where[PATH_MAX];
   if (where) {
     fprintf(stderr, RED "+ Not using %s %s: %s: %s\n" RESET, what,
-            printable(path, shown, sizeof(shown)),
-            printable(where, shown_where, sizeof(shown_where)), reason);
+            shown_name(path),
+            shown_name(where), reason);
   } else {
     fprintf(stderr, RED "+ Not using %s %s: %s\n" RESET, what,
-            printable(path, shown, sizeof(shown)), reason);
+            shown_name(path), reason);
   }
   return -1;
 }
@@ -594,9 +591,8 @@ int create_caches(const char *cache_dir) {
   snprintf(cache_leaf, sizeof(cache_leaf), "%s", leaf);
   cache_dir_owned = owned;
   if (!cache_dir_owned) {
-    char shown[PATH_MAX];
     fprintf(stderr, DARK_GREY "+ Cache directory %s already exists; it will not be removed on exit\n" RESET,
-            printable(cache_dir, shown, sizeof(shown)));
+            shown_name(cache_dir));
   }
   return 0;
 }
@@ -624,9 +620,8 @@ static int open_log_at(int parent_fd, const char *leaf, int flags, int is_fifo) 
   int fd = openat(parent_fd, leaf, flags | O_WRONLY | O_APPEND | O_NONBLOCK | O_CLOEXEC, 0600);
   for (int waited = 0; fd < 0 && errno == ENXIO && is_fifo; waited++) {
     if (waited == 0) {
-      char shown[PATH_MAX];
       fprintf(stderr, DARK_GREY "+ Waiting for a reader of the log FIFO %s\n" RESET,
-              printable(log_given, shown, sizeof(shown)));
+              shown_name(log_given));
     }
     stop_if_signalled();
     usleep(100000);
@@ -652,9 +647,8 @@ static const char *regular_log_problem(int fd, const struct stat *st) {
     if (fchmod(fd, 0600) != 0) {
       return strerror(errno);
     }
-    char shown[PATH_MAX];
     fprintf(stderr, DARK_GREY "+ Log file %s had mode %04o; made it 0600, as it holds diffs of watched files\n" RESET,
-            printable(log_given, shown, sizeof(shown)), (unsigned)(st->st_mode & 07777));
+            shown_name(log_given), (unsigned)(st->st_mode & 07777));
   }
   return NULL;
 }
@@ -862,9 +856,8 @@ void log_end(void) {
     }
     sigprocmask(SIG_SETMASK, &log_prev_mask, NULL);
     if (failed && !log_broken) {
-      char shown[PATH_MAX];
       fprintf(stderr, RED "+ Log %s: %s; entries are lost until it has a reader again\n" RESET,
-              printable(log_given, shown, sizeof(shown)), strerror(errno));
+              shown_name(log_given), strerror(errno));
     }
     log_broken = failed;
     clearerr(log_stream);
@@ -939,7 +932,6 @@ void create_cache_for_file(const char *path, const char *io_path, const char *ca
         free(*cached_path);
         *cached_path = NULL;
     } else if (verbose) {
-        char shown[PATH_MAX];
-        printf(DARK_GREY "+ Cached: %s\n" RESET, printable(path, shown, sizeof(shown)));
+        printf(DARK_GREY "+ Cached: %s\n" RESET, shown_name(path));
     }
 }
