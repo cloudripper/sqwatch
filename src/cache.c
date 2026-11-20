@@ -870,6 +870,17 @@ static int log_parent_fd = -1;           // regular file only: checked parent
 static char log_leaf[NAME_MAX + 1];      // regular file only: name in it
 static int log_is_pipe;                  // FIFO or pipe: SIGPIPE held
 static int log_broken;                   // the reader of the pipe went away
+
+// Whether name in the directory dir_fd is where the log file is written: the
+// log's own name in its parent, which may name a new file once the log was
+// rotated, until sqwatch opens that file (see log_begin())
+int is_log_name(int dir_fd, const char *name) {
+  struct stat parent_st, st;
+  return log_parent_fd >= 0 && dir_fd >= 0 && strcmp(name, log_leaf) == 0 &&
+         fstat(log_parent_fd, &parent_st) == 0 && fstat(dir_fd, &st) == 0 &&
+         parent_st.st_dev == st.st_dev && parent_st.st_ino == st.st_ino;
+}
+
 static sigset_t log_prev_mask;
 
 // Whether fd is the cache directory (with every run's directory in it).

@@ -108,7 +108,7 @@ Intercept (fanotify; needs the `CAP_SYS_ADMIN` capability, that is, root):
 
 Diff:
 - `--diff`: Show what changed in each file, from a private cache. A file over 64 MiB is not copied, nor one that would take all the copies together over 256 MiB: only its size and modification time are kept, and a change to it is reported without a diff (a notice says when that starts). Each diff shown, and logged, stops after 500 lines or 1 MiB, with a note of how many lines were left out
-- `-l FILE`: Also write the diffs to FILE (needs `--diff`)
+- `-l FILE`: Also write the diffs to FILE (needs `--diff`). FILE may be rotated: once it is renamed away, the next diff goes to a new file under its name. Inside a watched tree, that name is never watched, nor the file it names
 
 Other:
 - `-v`: Verbose output

@@ -8,6 +8,7 @@
 #include <sys/inotify.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -1043,7 +1044,7 @@ static file_entry *watch_file(sqwatch_config *config, dir_entry *dir, int dir_fd
         }
         return NULL;
     }
-    if (is_log_file(fd)) {
+    if (is_log_file(fd) || is_log_name(dir_fd, name)) {
         if (config->verbose) {
             printf(DARK_GREY "+ Not watching the log file %s\n" RESET, shown_name(path));
         }
@@ -1651,7 +1652,19 @@ void cache_watched_files(sqwatch_config *config) {
 // signal (-s, TERM by default), and KILL to what is left after
 // RESTART_GRACE_MS. A signal to sqwatch meanwhile ends the wait through
 // cleanup()
+// A pidfd of the command started last, polled while a -w rerun waits for it
+// to end; -1 if none
+static int command_pidfd = -1;
+
+static void forget_command_pidfd(void) {
+    if (command_pidfd >= 0) {
+        close(command_pidfd);
+        command_pidfd = -1;
+    }
+}
+
 static void stop_command(void) {
+    forget_command_pidfd();
     if (g_last_pid > 0) {
         killpg(g_last_pid, stop_signal ? stop_signal : SIGTERM);
         for (int waited = 0;; waited += 10) {
@@ -1728,6 +1741,8 @@ static void start_command(const char *command, const char *path, const char *eve
         // start cannot miss it; fails harmlessly once the child has exec'd
         setpgid(g_last_pid, g_last_pid);
         sigprocmask(SIG_SETMASK, &prev, NULL);
+        forget_command_pidfd();
+        command_pidfd = (int)syscall(SYS_pidfd_open, g_last_pid, 0);
     }
 }
 
@@ -1779,7 +1794,11 @@ static void run_command(event_loop *loop, const char *path, const char *event) {
 // Whether the command started last is still running: its first process,
 // the shell, has not exited
 static int command_running(void) {
-    return g_last_pid > 0 && waitpid(g_last_pid, NULL, WNOHANG) == 0;
+    if (g_last_pid > 0 && waitpid(g_last_pid, NULL, WNOHANG) == 0) {
+        return 1;
+    }
+    forget_command_pidfd();
+    return 0;
 }
 
 // Make the run asked for. Runs are coalesced: inside the debounce window of
@@ -1893,7 +1912,10 @@ static void fire_file_fd(event_loop *loop, file_entry *f, uint32_t mask, int qui
     int gone = fd == -1 && errno == ENOENT;
     char io_path[FD_PATH_LEN];
     struct stat st;
-    if (fd != -1 && fstat(fd, &st) == 0) {
+    // What the file was like when a write to it was handled: the events
+    // that come after it and belong to it (a close after the write) leave
+    // nothing new to show (see run_due())
+    if (fd != -1 && (mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_IGNORED)) && fstat(fd, &st) == 0) {
         f->fired_ctime = st.st_ctim;
         f->fired_size = st.st_size;
     }
@@ -1971,11 +1993,26 @@ static int run_due(event_loop *loop) {
             i++;
             continue;
         }
-        // Events that came after the change was handled but belong to it (a
-        // close after the write) leave nothing new to show
+        // Events that came after the write was handled but belong to it (a
+        // close after the write) leave nothing new to show. A write whose
+        // file looks the same (a change time is coarse) is compared with
+        // the cache; without one it is handled. Other events are handled
         int same = fd == -1 || (fstat(fd, &st) == 0 && st.st_size == f->fired_size &&
                                 st.st_ctim.tv_sec == f->fired_ctime.tv_sec &&
                                 st.st_ctim.tv_nsec == f->fired_ctime.tv_nsec);
+        if (same && fd != -1 && (f->pending & ~(IN_MODIFY | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE))) {
+            same = 0;
+        } else if (same && fd != -1 && (f->pending & IN_MODIFY)) {
+            if (config->diff_enabled && cache_of(f)) {
+                char io_path[FD_PATH_LEN];
+                fd_path(fd, io_path, sizeof(io_path));
+                own_reads(config, f->dir, 1);
+                same = !cache_differs(io_path, cache_of(f));
+                own_reads(config, f->dir, 0);
+            } else {
+                same = 0;
+            }
+        }
         if (fd != -1) {
             close(fd);
         }
@@ -1988,12 +2025,8 @@ static int run_due(event_loop *loop) {
         }
         fire_file(loop, f, f->pending, 0, 1);  // takes f out of the list
     }
-    if (loop->rerun) {
-        if (command_running()) {
-            next = next < 0 || loop->now + 50 < next ? loop->now + 50 : next;
-        } else {
-            loop->command_wanted = 1;
-        }
+    if (loop->rerun && !command_running()) {
+        loop->command_wanted = 1;
     }
     flush_command(loop);
     if (loop->command_due) {
@@ -2007,6 +2040,10 @@ static int run_due(event_loop *loop) {
             next = next < 0 || due < next ? due : next;
         }
     }
+    if (loop->rerun && command_pidfd < 0) {
+        // No pidfd to poll for the end of the command: look every 50 ms
+        next = next < 0 || loop->now + 50 < next ? loop->now + 50 : next;
+    }
     if (next < 0) {
         return -1;
     }
@@ -2014,9 +2051,12 @@ static int run_due(event_loop *loop) {
     return wait > 60000 ? 60000 : wait < 0 ? 0 : (int)wait;
 }
 
-// Whether name in the directory dir_fd is sqwatch's own log file or cache
-// directory
+// Whether name in the directory dir_fd is sqwatch's own log file (or where
+// it is written, after a rotation) or cache directory
 static int is_own_file(int dir_fd, const char *name) {
+    if (is_log_name(dir_fd, name)) {
+        return 1;
+    }
     int fd = dir_fd == -1 ? -1 : openat(dir_fd, name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
     int own = fd != -1 && (is_log_file(fd) || is_cache_dir(fd));
     if (fd != -1) {
@@ -2295,6 +2335,11 @@ static int on_dir_event(event_loop *loop, dir_entry *dir, const struct inotify_e
         }
         if (!f && (mask & config->flags)) {
             f = watch_file(config, dir, dir_fd, name, full_path, root, 1);
+            if ((mask & (IN_MODIFY | IN_CLOSE_WRITE)) == IN_CLOSE_WRITE) {
+                // Closed after writes not seen here, as the log file
+                // sqwatch closes once it was rotated: nothing to compare with
+                mask &= ~IN_CLOSE_WRITE;
+            }
         }
         if (f && (mask & config->flags)) {
             fire_file(loop, f, mask, 0, 0);
@@ -2494,9 +2539,9 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
         // stdout is polled for an error only: its reader went away. With -p
         // the events the reader thread queued and the end of the command
         // deciding one wake the loop too
-        struct pollfd fds[5] = {{inotify_fd, POLLIN, 0}, {signal_fd, POLLIN, 0},
-                                {STDOUT_FILENO, 0, 0}, {perm_wake_fd(), POLLIN, 0},
-                                {perm_decider_fd(), POLLIN, 0}};
+        struct pollfd fds[6] = {{inotify_fd, POLLIN, 0}, {signal_fd, POLLIN, 0},
+                                {STDOUT_FILENO, 0, 0}, {-1, POLLIN, 0}, {-1, POLLIN, 0},
+                                {-1, POLLIN, 0}};
         if (config->watch_failed != reported_failure) {
             // Part of the tree is not watched: like lost events. The message
             // is shown once (see watch_failed()); each new failure runs the
@@ -2508,15 +2553,18 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
             flush_command(&loop);
         }
         int timeout = run_due(&loop);
+        // With -w a rerun waits for the command to end: its pidfd says when
+        fds[5].fd = loop.rerun ? command_pidfd : -1;
         if (perm_active()) {
             int perm_timeout = perm_work();
+            fds[3].fd = perm_wake_fd();
             fds[4].fd = perm_decider_fd();
             if (perm_timeout >= 0 && (timeout < 0 || perm_timeout < timeout)) {
                 timeout = perm_timeout;
             }
         }
         stop_if_output_closed();
-        if (poll(fds, perm_active() ? 5 : 3, timeout) == -1) {
+        if (poll(fds, 6, timeout) == -1) {
             if (errno == EINTR) {
                 continue;
             }

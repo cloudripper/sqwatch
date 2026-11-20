@@ -36,6 +36,7 @@ void remove_caches(void);
 int create_caches(const char *cache_dir);
 int open_log_file(const char *log_file);
 int is_log_file(int fd);
+int is_log_name(int dir_fd, const char *name);
 int is_cache_dir(int fd);
 FILE *log_begin(void);
 void log_end(void);
