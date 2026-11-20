@@ -1240,26 +1240,33 @@ void cache_watched_files(sqwatch_config *config) {
 }
 
 
-// Terminate the process group of the previously started command, if any
+// The grace a command gets to end after the stop signal on a restart; on
+// exit cleanup() gives it 5 s
+#define RESTART_GRACE_MS 2000
+
+// Stop the process group of the previously started command, if any: the stop
+// signal (-s, TERM by default), and KILL to what is left after
+// RESTART_GRACE_MS. A signal to sqwatch meanwhile ends the wait through
+// cleanup()
 static void stop_command(void) {
     if (g_last_pid > 0) {
-        // Send SIGTERM to the entire process group
-        killpg(g_last_pid, SIGTERM);
-
-        // Wait a short time for graceful termination
-        struct timespec timeout = {0, 100000000}; // 100ms
-        nanosleep(&timeout, NULL);
-
-        // If process still exists, force kill
-        if (kill(-g_last_pid, 0) == 0) {
-            killpg(g_last_pid, SIGKILL);
+        killpg(g_last_pid, stop_signal ? stop_signal : SIGTERM);
+        for (int waited = 0;; waited += 10) {
+            while (waitpid(-g_last_pid, NULL, WNOHANG) > 0) {
+            }
+            if (kill(-g_last_pid, 0) != 0) {
+                break;
+            }
+            if (waited >= RESTART_GRACE_MS) {
+                killpg(g_last_pid, SIGKILL);
+                while (waitpid(-g_last_pid, NULL, 0) > 0) {
+                }
+                break;
+            }
+            struct timespec step = {0, 10000000};
+            nanosleep(&step, NULL);
+            stop_if_signalled();
         }
-
-        // Wait for the process group to finish
-        while (waitpid(-g_last_pid, NULL, 0) > 0) {
-            // Continue waiting for all children
-        }
-
         g_last_pid = 0;
     }
     // As a subreaper sqwatch also inherits what an earlier command left
@@ -1924,6 +1931,9 @@ void print_usage(void) {
            "                 is stopped and started again\n"
            "  -w             Wait for a run still going to end instead of stopping it;\n"
            "                 the changes that come meanwhile lead to one more run after it\n"
+           "  -s SIGNAL      Signal that stops a run: a name, with or without SIG, or a\n"
+           "                 number (default: TERM). What is left of the run gets KILL\n"
+           "                 2 s later on a restart, 5 s later when sqwatch exits\n"
            "  -t SECONDS     Debounce time of each file, a decimal number (default: 1)\n"
            "                 The command gets the change in its environment: SQWATCH_PATH,\n"
            "                 the path, and SQWATCH_EVENT: modify, create, delete, move,\n"

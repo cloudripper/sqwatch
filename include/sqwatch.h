@@ -18,6 +18,7 @@
 
 
 extern pid_t g_last_pid;
+extern int stop_signal;     // -s, or 0 for the default, SIGTERM
 extern char *cache_dir;
 
 // A path named on the command line. Symlinks in it are followed once, at

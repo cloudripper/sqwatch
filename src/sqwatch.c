@@ -1,6 +1,7 @@
 #include "cache.h"
 #include "diff.h"
 #include "sqwatch.h"
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -19,6 +20,7 @@
 #include <unistd.h>
 
 pid_t g_last_pid = 0;
+int stop_signal = 0;
 char *cache_dir = NULL;
 sqwatch_config config;
 // SIGINT and SIGTERM are read from here; see main()
@@ -27,8 +29,10 @@ static int signal_fd = -1;
 // Runs once SIGINT, SIGTERM or SIGHUP has been read from signal_fd, outside
 // any signal handler, or once stdout is found closed (see
 // stop_if_output_closed()). The cache goes first, as the command may take its
-// time to exit or ignore signo; another signal, or 5 s, and it is killed
+// time to exit or ignore the stop signal (-s, TERM by default); another
+// signal, or 5 s, and it is killed
 static void cleanup(int signo) {
+  (void)signo;
   printf(RED "\n+ Exiting SQWatch... \n" RESET);
 
   // Remove this run's cache entries, and the cache directory if this run
@@ -47,7 +51,7 @@ static void cleanup(int signo) {
   // zombie still counts as a member; sqwatch is a subreaper (see main()), so
   // the members it orphaned are its own children and are reaped here
   if (g_last_pid > 0) {
-    kill(-g_last_pid, signo);
+    kill(-g_last_pid, stop_signal ? stop_signal : SIGTERM);
     for (int waited = 0;; waited += 100) {
       while (waitpid(-g_last_pid, NULL, WNOHANG) > 0) {
       }
@@ -111,6 +115,10 @@ static const char *option_help(int opt) {
   case 'q': return "-q EVENTS: one or more of modify, create, delete, move, attrib, all,\n"
                    "  separated by commas, for example -q modify,create";
   case 'l': return "-l FILE: the log file for diffs (with --diff)";
+  case 's': return "-s SIGNAL: a name, with or without SIG, in any case, or a number:\n"
+                   "  HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM\n"
+                   "  STKFLT CHLD URG XCPU XFSZ VTALRM PROF WINCH IO PWR SYS,\n"
+                   "  RTMIN, RTMIN+N, RTMAX-N, or 1 to 64 (not STOP, TSTP, TTIN, TTOU, CONT)";
   case 'i': return "-i PATTERN: a shell pattern (see fnmatch(3)); with a '/' it is matched\n"
                    "  against the path below the watched directory, else against the name";
   default: return NULL;
@@ -196,6 +204,68 @@ static const char *format_seconds(long long ms) {
     text[--len] = '\0';
   }
   return text;
+}
+
+// The signal named by text: a name, with or without SIG, in any case, or a
+// number. Returns 0 and sets *problem if it is not one, or is one that would
+// pause or resume the command rather than stop it
+static int parse_signal(const char *text, const char **problem) {
+  static const struct {
+    const char *name;
+    int signo;
+  } names[] = {
+    {"HUP", SIGHUP}, {"INT", SIGINT}, {"QUIT", SIGQUIT}, {"ILL", SIGILL},
+    {"TRAP", SIGTRAP}, {"ABRT", SIGABRT}, {"IOT", SIGIOT}, {"BUS", SIGBUS},
+    {"FPE", SIGFPE}, {"KILL", SIGKILL}, {"USR1", SIGUSR1}, {"SEGV", SIGSEGV},
+    {"USR2", SIGUSR2}, {"PIPE", SIGPIPE}, {"ALRM", SIGALRM}, {"TERM", SIGTERM},
+    {"STKFLT", SIGSTKFLT}, {"CHLD", SIGCHLD}, {"CLD", SIGCHLD}, {"CONT", SIGCONT},
+    {"STOP", SIGSTOP}, {"TSTP", SIGTSTP}, {"TTIN", SIGTTIN}, {"TTOU", SIGTTOU},
+    {"URG", SIGURG}, {"XCPU", SIGXCPU}, {"XFSZ", SIGXFSZ}, {"VTALRM", SIGVTALRM},
+    {"PROF", SIGPROF}, {"WINCH", SIGWINCH}, {"IO", SIGIO}, {"POLL", SIGPOLL},
+    {"PWR", SIGPWR}, {"SYS", SIGSYS},
+  };
+  char upper[16];
+  size_t len = strlen(text);
+  int signo = 0;
+  if (len == 0 || len >= sizeof(upper)) {
+    *problem = "not a signal";
+    return 0;
+  }
+  for (size_t i = 0; i <= len; i++) {
+    upper[i] = (char)toupper((unsigned char)text[i]);
+  }
+  const char *name = strncmp(upper, "SIG", 3) == 0 ? upper + 3 : upper;
+  char *end;
+  if (*name >= '0' && *name <= '9' && name == upper) {
+    long n = strtol(name, &end, 10);
+    signo = *end == '\0' && n >= 1 && n <= SIGRTMAX ? (int)n : 0;
+  } else if (strncmp(name, "RTMIN", 5) == 0 || strncmp(name, "RTMAX", 5) == 0) {
+    long n = 0;
+    end = (char *)name + 5;
+    if (*end == (name[4] == 'N' ? '+' : '-') && end[1] >= '0' && end[1] <= '9') {
+      n = strtol(end + 1, &end, 10);
+    }
+    signo = name[4] == 'N' ? SIGRTMIN + (int)n : SIGRTMAX - (int)n;
+    if (*end != '\0' || signo < SIGRTMIN || signo > SIGRTMAX) {
+      signo = 0;
+    }
+  } else {
+    for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); n++) {
+      if (strcmp(name, names[n].name) == 0) {
+        signo = names[n].signo;
+      }
+    }
+  }
+  if (!signo) {
+    *problem = "not a signal";
+  } else if (signo == SIGSTOP || signo == SIGTSTP || signo == SIGTTIN || signo == SIGTTOU) {
+    *problem = "it would pause the command, not stop it";
+    signo = 0;
+  } else if (signo == SIGCONT) {
+    *problem = "it resumes a paused command and stops nothing";
+    signo = 0;
+  }
+  return signo;
 }
 
 // The inotify events of a -q list: names separated by commas. Returns 0 and
@@ -311,7 +381,7 @@ int main(int argc, char *argv[]) {
   // Errors are reported here, not by getopt: a leading ':' tells a missing
   // argument from an unknown option
   opterr = 0;
-  while ((opt = getopt_long(argc, argv, ":d:f:t:q:c:l:i:wvh", long_options, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, ":d:f:t:q:c:l:i:s:wvh", long_options, NULL)) != -1) {
     struct stat statbuf;
     switch (opt) {
     case 'd':
@@ -381,6 +451,14 @@ int main(int argc, char *argv[]) {
     case 'w':
       config.wait = 1;
       break;
+    case 's': {
+      const char *problem = NULL;
+      stop_signal = parse_signal(optarg, &problem);
+      if (!stop_signal) {
+        bad_value('s', optarg, problem);
+      }
+      break;
+    }
     case 'v':
       verbose = 1;
       break;
