@@ -204,14 +204,268 @@ static int reopen_file_root(watch_root *root) {
     return 0;
 }
 
+// Watch the regular file `name` in the directory parent_fd; path is its
+// displayed path. A file in a directory that appeared at runtime is cached here
+static void watch_file(int inotify_fd, int parent_fd, const char *name, const char *path,
+                       int root, uint32_t flags, sqwatch_config *config, int at_runtime) {
+    int fd = open_file_at(parent_fd, name);
+    int wd = fd == -1 ? -1 : add_watch_fd(inotify_fd, fd, flags);
+    if (wd >= 0 && wd < MAX_PATHS) {
+        config->watch_paths[wd] = strdup(path);
+        config->watch_roots[wd] = root;
+        config->path_count++;
+        if (at_runtime && config->diff_enabled && cache_dir) {
+            char io_path[FD_PATH_LEN];
+            free(config->cached_paths[wd]);
+            config->cached_paths[wd] = NULL;
+            create_cache_for_file(path, fd_path(fd, io_path, sizeof(io_path)), cache_dir,
+                                  &config->cached_paths[wd], config->verbose);
+        }
+        if (config->verbose) {
+            printf(CYAN "+ Watch set for file %s\n" RESET, path);
+        }
+    }
+    if (fd != -1) {
+        close(fd);
+    }
+}
+
+// Watch the directory dir_fd refers to; path is its displayed path
+static void watch_dir(int inotify_fd, int dir_fd, const char *path, int root, uint32_t flags,
+                      sqwatch_config *config) {
+    int wd = add_watch_fd(inotify_fd, dir_fd, flags | IN_CREATE);
+    if (wd == -1) {
+        return;
+    }
+    // A directory watched before (walked again, or reached by another name)
+    // gets the wd it already has: update its entry instead of adding one
+    for (int d = 0; d < config->dir_watch_count; d++) {
+        if (config->dir_watches[d].wd == wd) {
+            char *copy = strdup(path);
+            if (copy) {
+                free(config->dir_watches[d].path);
+                config->dir_watches[d].path = copy;
+                config->dir_watches[d].root = root;
+            }
+            if (config->verbose) {
+                printf(CYAN "+ Watch set for directory %s\n" RESET, path);
+            }
+            return;
+        }
+    }
+    if (config->dir_watch_count >= config->max_dir_watches) {
+        int new_size = config->max_dir_watches * 2;
+        dir_watch *new_watches = realloc(config->dir_watches, new_size * sizeof(dir_watch));
+        if (!new_watches) {
+            fprintf(stderr, RED "+ Failed to allocate memory for dir watches\n" RESET);
+            return;
+        }
+        config->dir_watches = new_watches;
+        config->max_dir_watches = new_size;
+    }
+
+    config->dir_watches[config->dir_watch_count].path = strdup(path);
+    config->dir_watches[config->dir_watch_count].wd = wd;
+    config->dir_watches[config->dir_watch_count].root = root;
+    config->dir_watch_count++;
+
+    if (config->verbose) {
+        printf(CYAN "+ Watch set for directory %s\n" RESET, path);
+    }
+}
+
+// A directory the walk is in, from where it started down to the current one
+typedef struct {
+    char **names;            // Its subdirectories, in readdir order
+    size_t count;            // Number of names
+    size_t next;             // Index of the next name to look at
+    dev_t dev;               // The directory found and watched, to know it
+    ino_t ino;               // again when the walk comes back to it
+    size_t path_len;         // Length of its displayed path in the path buffer
+} walk_level;
+
+static void free_level(walk_level *level) {
+    for (size_t i = 0; i < level->count; i++) {
+        free(level->names[i]);
+    }
+    free(level->names);
+}
+
+// Whether fd is the directory a level was made for
+static int is_level_dir(int fd, const walk_level *level) {
+    struct stat st;
+    return fstat(fd, &st) == 0 && st.st_dev == level->dev && st.st_ino == level->ino;
+}
+
+// Read the directory fd refers to, whose displayed path is in the walk's path
+// buffer (PATH_MAX bytes). Regular files are watched and symlinks reported as
+// they are read; only the names of subdirectories are kept in level, to be
+// walked later, so a directory with many entries costs memory only for its
+// subdirectories. The type comes from readdir(), or from fstatat() on a
+// filesystem that does not give it. fd stays open and usable. Returns -1 with
+// errno set if the directory cannot be read
+static int read_names(int inotify_fd, int fd, char *path, int root, uint32_t flags,
+                      sqwatch_config *config, int at_runtime, walk_level *level) {
+    int dir_fd = dup(fd);
+    DIR *dir = dir_fd == -1 ? NULL : fdopendir(dir_fd);
+    if (!dir) {
+        int saved_errno = errno;
+        if (dir_fd != -1) {
+            close(dir_fd);
+        }
+        errno = saved_errno;
+        return -1;
+    }
+    size_t len = strlen(path), size = 0, seen = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if ((++seen & 1023) == 0) {
+            stop_if_signalled();
+        }
+        const char *name = entry->d_name;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            continue;
+        }
+        unsigned char type = entry->d_type;
+        if (type != DT_DIR && type != DT_REG && type != DT_LNK && type != DT_UNKNOWN) {
+            continue;  // FIFOs, sockets and devices are not watched
+        }
+        if (type != DT_DIR) {
+            if (snprintf(path + len, PATH_MAX - len, "/%s", name) >= (int)(PATH_MAX - len)) {
+                path[len] = '\0';
+                fprintf(stderr, RED "+ Path too long, skipping %s/%s\n" RESET, path, name);
+                continue;
+            }
+            struct stat st;
+            if (type == DT_UNKNOWN) {
+                if (fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == -1) {
+                    fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, path,
+                            strerror(errno));
+                    path[len] = '\0';
+                    continue;
+                }
+                type = S_ISDIR(st.st_mode) ? DT_DIR : S_ISREG(st.st_mode) ? DT_REG :
+                       S_ISLNK(st.st_mode) ? DT_LNK : DT_UNKNOWN;
+            }
+            if (type == DT_LNK && config->verbose) {
+                printf(DARK_GREY "+ Skipping symlink %s\n" RESET, path);
+            } else if (type == DT_REG) {
+                watch_file(inotify_fd, fd, name, path, root, flags, config, at_runtime);
+            }
+            path[len] = '\0';
+            if (type != DT_DIR) {
+                continue;
+            }
+        }
+        if (level->count == size) {
+            size_t new_size = size ? size * 2 : 16;
+            char **grown = realloc(level->names, new_size * sizeof(*grown));
+            if (!grown) {
+                break;
+            }
+            level->names = grown;
+            size = new_size;
+        }
+        char *copy = strdup(name);
+        if (!copy) {
+            break;
+        }
+        level->names[level->count++] = copy;
+    }
+    if (entry) {
+        fprintf(stderr, RED "+ Out of memory, not watching all of %s\n" RESET, path);
+    }
+    closedir(dir);
+    return 0;
+}
+
+// Watch the directory fd refers to, whose displayed path is the walk's path
+// buffer, watch its files and make it the innermost level, holding its
+// subdirectories. Returns 0 if it could not be read; fd is the caller's either
+// way
+static int enter_dir(int inotify_fd, int fd, char *path, int root, uint32_t flags,
+                     sqwatch_config *config, int at_runtime, walk_level **levels,
+                     size_t *depth, size_t *size) {
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, path, strerror(errno));
+        return 0;
+    }
+    if (*depth == *size) {
+        size_t new_size = *size ? *size * 2 : 16;
+        walk_level *grown = realloc(*levels, new_size * sizeof(*grown));
+        if (!grown) {
+            fprintf(stderr, RED "+ Out of memory, not watching %s\n" RESET, path);
+            return 0;
+        }
+        *levels = grown;
+        *size = new_size;
+    }
+    watch_dir(inotify_fd, fd, path, root, flags, config);
+    walk_level *level = &(*levels)[*depth];
+    *level = (walk_level){NULL, 0, 0, st.st_dev, st.st_ino, strlen(path)};
+    if (read_names(inotify_fd, fd, path, root, flags, config, at_runtime, level) != 0) {
+        fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, path, strerror(errno));
+        return 0;
+    }
+    (*depth)++;
+    return 1;
+}
+
+// Get back to the innermost level's directory after its subdirectory child_fd
+// is done, which this closes. ".." of the subdirectory is used if it is still
+// that directory. If not, the subdirectory was moved, or the directory was:
+// it is opened again from the root by its displayed path, and if that is not
+// it either, the rest of it is given up and the walk goes on with the level
+// above. Returns a descriptor of the innermost level left, or -1 if none is
+static int climb(int child_fd, const watch_root *top, char *path, walk_level *levels,
+                 size_t *depth) {
+    int fd = openat(child_fd, "..", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    close(child_fd);
+    while (*depth > 0) {
+        walk_level *level = &levels[*depth - 1];
+        path[level->path_len] = '\0';
+        if (fd != -1 && is_level_dir(fd, level)) {
+            return fd;
+        }
+        if (fd != -1) {
+            close(fd);
+        }
+        fd = open_beneath(top->fd, rel_path(top, path), O_RDONLY | O_DIRECTORY);
+        if (fd != -1 && is_level_dir(fd, level)) {
+            return fd;
+        }
+        if (fd != -1) {
+            close(fd);
+            fd = -1;
+        }
+        fprintf(stderr, RED "+ %s was moved or replaced, not watching the rest of it\n" RESET,
+                path);
+        free_level(level);
+        (*depth)--;
+    }
+    return -1;
+}
+
 // Add watches for the entry `name` of the directory parent_fd and, if it is a
 // directory, for everything below it. path is the entry's displayed path.
-// Entries are only ever reached relative to a descriptor and symlinks are not
-// followed, so the walk cannot leave the tree it started in. at_runtime is set
-// for a directory that appeared after startup: its files are cached here, as
+// The walk is depth first. The files of a directory are watched while it is
+// read, before any of its subdirectories is entered; the recursive walk of
+// v0.4.1 took files and subdirectories in readdir order instead, so under the
+// MAX_PATHS limit on watch descriptors the files that fit can differ from it.
+// It holds one descriptor, of the directory it is in, and keeps the names of
+// the subdirectories still to walk of each directory on the way down on the
+// heap: there is no recursion and no descriptor held per level, however deep
+// the tree. A directory is read in full when the walk enters it, as a readdir
+// position cannot be kept without keeping its stream open. Directories are
+// entered with openat() relative to the current one and left through "..",
+// checked to be the directory entered before; symlinks are never followed, so
+// the walk cannot leave the tree it started in. at_runtime is set for a
+// directory that appeared after startup: its files are cached here, as
 // cache_watched_files() only covers the startup walk
 static void add_watches_walk(int inotify_fd, int parent_fd, const char *name, const char *path,
                              int root, uint32_t flags, sqwatch_config *config, int at_runtime) {
+    const watch_root *top = &config->roots[root];
     struct stat path_stat;
     if (fstatat(parent_fd, name, &path_stat, AT_SYMLINK_NOFOLLOW) == -1) {
         fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, path, strerror(errno));
@@ -225,90 +479,86 @@ static void add_watches_walk(int inotify_fd, int parent_fd, const char *name, co
         return;
     }
 
-    if (S_ISDIR(path_stat.st_mode)) {
-        stop_if_signalled();
-        int dir_fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-        if (dir_fd == -1) {
-            fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, path, strerror(errno));
-            return;
-        }
-
-        // Add directory watch separately from file watches
-        int wd = add_watch_fd(inotify_fd, dir_fd, flags | IN_CREATE);
-        if (wd != -1) {
-            // Add to directory watches
-            if (config->dir_watch_count >= config->max_dir_watches) {
-                int new_size = config->max_dir_watches * 2;
-                dir_watch *new_watches = realloc(config->dir_watches,
-                                               new_size * sizeof(dir_watch));
-                if (!new_watches) {
-                    fprintf(stderr, RED "+ Failed to allocate memory for dir watches\n" RESET);
-                    close(dir_fd);
-                    return;
-                }
-                config->dir_watches = new_watches;
-                config->max_dir_watches = new_size;
-            }
-
-            config->dir_watches[config->dir_watch_count].path = strdup(path);
-            config->dir_watches[config->dir_watch_count].wd = wd;
-            config->dir_watches[config->dir_watch_count].root = root;
-            config->dir_watch_count++;
-
-            if (config->verbose) {
-                printf(CYAN "+ Watch set for directory %s\n" RESET, path);
-            }
-        }
-
-        // Recurse into directory contents. The stream takes over dir_fd and
-        // closedir() closes it
-        DIR *dir = fdopendir(dir_fd);
-        if (!dir) {
-            fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, path, strerror(errno));
-            close(dir_fd);
-            return;
-        }
-
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL) {
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-                continue;
-            }
-
-            char full_path[PATH_MAX];
-            if (snprintf(full_path, sizeof(full_path), "%s/%s", path,
-                         entry->d_name) >= (int)sizeof(full_path)) {
-                fprintf(stderr, RED "+ Path too long, skipping %s/%s\n" RESET,
-                        path, entry->d_name);
-                continue;
-            }
-            add_watches_walk(inotify_fd, dir_fd, entry->d_name, full_path, root, flags, config,
-                             at_runtime);
-        }
-        closedir(dir);
-    } else if (S_ISREG(path_stat.st_mode)) {
-        // Regular file handling remains unchanged
-        int fd = open_file_at(parent_fd, name);
-        int wd = fd == -1 ? -1 : add_watch_fd(inotify_fd, fd, flags);
-        if (wd >= 0 && wd < MAX_PATHS) {
-            config->watch_paths[wd] = strdup(path);
-            config->watch_roots[wd] = root;
-            config->path_count++;
-            if (at_runtime && config->diff_enabled && cache_dir) {
-                char io_path[FD_PATH_LEN];
-                free(config->cached_paths[wd]);
-                config->cached_paths[wd] = NULL;
-                create_cache_for_file(path, fd_path(fd, io_path, sizeof(io_path)), cache_dir,
-                                      &config->cached_paths[wd], config->verbose);
-            }
-            if (config->verbose) {
-                printf(CYAN "+ Watch set for file %s\n" RESET, path);
-            }
-        }
-        if (fd != -1) {
-            close(fd);
-        }
+    if (S_ISREG(path_stat.st_mode)) {
+        watch_file(inotify_fd, parent_fd, name, path, root, flags, config, at_runtime);
+        return;
     }
+
+    // A -f root names one file; if it has been replaced by a directory since it
+    // was checked, nothing is watched
+    if (!S_ISDIR(path_stat.st_mode) || top->rel) {
+        return;
+    }
+
+    char dir_path[PATH_MAX];
+    if (snprintf(dir_path, sizeof(dir_path), "%s", path) >= (int)sizeof(dir_path)) {
+        fprintf(stderr, RED "+ Path too long, skipping %s\n" RESET, path);
+        return;
+    }
+    int cur = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (cur == -1) {
+        fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, path, strerror(errno));
+        return;
+    }
+
+    walk_level *levels = NULL;
+    size_t depth = 0, size = 0;
+    if (!enter_dir(inotify_fd, cur, dir_path, root, flags, config, at_runtime, &levels, &depth,
+                   &size)) {
+        close(cur);
+        free(levels);
+        return;
+    }
+
+    while (depth > 0) {
+        stop_if_signalled();
+        walk_level *level = &levels[depth - 1];
+        if (level->next == level->count) {
+            free_level(level);
+            depth--;
+            if (depth > 0) {
+                cur = climb(cur, top, dir_path, levels, &depth);
+            } else {
+                close(cur);
+            }
+            continue;
+        }
+
+        const char *entry = level->names[level->next++];
+        size_t len = level->path_len;
+        if (snprintf(dir_path + len, sizeof(dir_path) - len, "/%s", entry) >=
+            (int)(sizeof(dir_path) - len)) {
+            dir_path[len] = '\0';
+            fprintf(stderr, RED "+ Path too long, skipping %s/%s\n" RESET, dir_path, entry);
+            continue;
+        }
+
+        struct stat st;
+        if (fstatat(cur, entry, &st, AT_SYMLINK_NOFOLLOW) == -1) {
+            fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, dir_path, strerror(errno));
+        } else if (S_ISLNK(st.st_mode)) {
+            if (config->verbose) {
+                printf(DARK_GREY "+ Skipping symlink %s\n" RESET, dir_path);
+            }
+        } else if (S_ISREG(st.st_mode)) {
+            watch_file(inotify_fd, cur, entry, dir_path, root, flags, config, at_runtime);
+        } else if (S_ISDIR(st.st_mode)) {
+            int fd = openat(cur, entry, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (fd == -1) {
+                fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, dir_path,
+                        strerror(errno));
+            } else if (enter_dir(inotify_fd, fd, dir_path, root, flags, config, at_runtime,
+                                 &levels, &depth, &size)) {
+                close(cur);
+                cur = fd;
+                continue;
+            } else {
+                close(fd);
+            }
+        }
+        dir_path[len] = '\0';
+    }
+    free(levels);
 }
 
 // Start watching a path named on the command line. This and
