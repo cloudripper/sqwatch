@@ -1,6 +1,7 @@
 #include <sys/types.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <time.h>
 
 #include "diff.h"
 
@@ -49,6 +50,12 @@ typedef struct {
     int name_count;
     char *cached;            // A file's cache entry, or NULL
     unsigned char changed;   // In the changed list: why (CHANGED_*)
+    long long last_fire;     // When its last change was handled, in ms of
+                             // CLOCK_MONOTONIC; 0 if never
+    uint32_t pending;        // Events deferred to the end of its debounce
+                             // window; non-zero while in the pending list
+    struct timespec fired_ctime;  // Its status change time and size when its
+    off_t fired_size;             // last change was handled
 } watch_entry;
 
 #define CHANGED_TAKEOVER 1   // Took over the cache entry of a name it replaced
@@ -86,9 +93,12 @@ typedef struct {
     int *changed;            // Files to diff against their cache entry, as
     size_t changed_count;    // they may have changed without an event of
     size_t changed_size;     // their own (see mark_changed())
+    int *pending;            // Files with events deferred by the debounce
+    size_t pending_count;
+    size_t pending_size;
     watch_root *roots;       // One per -d or -f
     int root_count;
-    uint8_t debounce_t;
+    unsigned debounce_t;     // Seconds
     int verbose;
     int diff_enabled;        // New flag for diff functionality
     const char *log_file;

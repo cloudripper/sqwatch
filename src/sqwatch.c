@@ -101,7 +101,7 @@ int main(int argc, char *argv[]) {
   char **paths = calloc(argc, sizeof(*paths));
   int path_count = 0;
   int opt;
-  uint32_t debounce_t = 1;
+  unsigned debounce_t = 1;
   char *log_file = NULL;
   int verbose = 0;
 
@@ -158,8 +158,8 @@ int main(int argc, char *argv[]) {
       }
       break;
     case 't':
-      debounce_t = atoi(optarg);
-      printf(DARK_GREY "+ Debounce set to %d\n" RESET, debounce_t);
+      debounce_t = atoi(optarg) > 0 ? atoi(optarg) : 0;
+      printf(DARK_GREY "+ Debounce set to %u\n" RESET, debounce_t);
       break;
     case 'q':
       if (strcmp(optarg, "all") == 0) {

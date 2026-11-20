@@ -640,6 +640,14 @@ static int log_is_pipe;                  // FIFO or pipe: SIGPIPE held
 static int log_broken;                   // the reader of the pipe went away
 static sigset_t log_prev_mask;
 
+// Whether fd is the log file. sqwatch does not watch its own log when it is in
+// a watched tree: each diff written to it would be a change to diff in turn
+int is_log_file(int fd) {
+  struct stat log_st, st;
+  return log_stream && fstat(fileno(log_stream), &log_st) == 0 && fstat(fd, &st) == 0 &&
+         log_st.st_dev == st.st_dev && log_st.st_ino == st.st_ino;
+}
+
 static int owned_by_root_or_me(const struct stat *st) {
   return st->st_uid == 0 || st->st_uid == root_uid || st->st_uid == geteuid();
 }

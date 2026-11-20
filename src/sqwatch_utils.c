@@ -727,6 +727,13 @@ static watch_entry *attach_name(int inotify_fd, sqwatch_config *config, int wd, 
 static void watch_file(int inotify_fd, int parent_fd, const char *name, const char *path,
                        int root, uint32_t flags, sqwatch_config *config, int at_runtime) {
     int fd = open_file_at(parent_fd, name);
+    if (fd != -1 && is_log_file(fd)) {
+        if (config->verbose) {
+            printf(DARK_GREY "+ Not watching the log file %s\n" RESET, shown_name(path));
+        }
+        close(fd);
+        return;
+    }
     int wd = fd == -1 ? -1 : add_watch_fd(inotify_fd, fd, flags);
     int added = 0;
     watch_entry *entry = wd < 0 ? NULL :
@@ -1260,14 +1267,48 @@ static void start_command(const char *command) {
     }
 }
 
-// What handle_events() keeps between events
+// What handle_events() keeps between events. Times are in ms of
+// CLOCK_MONOTONIC, so that a change of the wall clock does not open or close
+// a debounce window
 typedef struct {
     int inotify_fd;
     sqwatch_config *config;
-    time_t now;
-    time_t last_event;       // Last trigger for a change to a file
-    time_t last_create;      // Last trigger for an entry created, removed or moved
+    long long now;
+    long long window;        // The debounce time
+    long long command_run;   // When the command was last started; 0 if never
+    int command_wanted;      // A run was asked for while handling events
+    int command_due;         // A run is to be made when the window closes
 } event_loop;
+
+static long long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000 + 1;
+}
+
+// Ask for the command to be started again for a change. The requests made
+// while a buffer of events is handled come to one run, made by
+// flush_command() once the buffer is done
+static void run_command(event_loop *loop) {
+    loop->command_wanted = 1;
+}
+
+// Make the run asked for. Runs are coalesced: inside the debounce window of
+// the last run, one more is made when the window closes (see run_due())
+static void flush_command(event_loop *loop) {
+    if (!loop->command_wanted) {
+        return;
+    }
+    loop->command_wanted = 0;
+    if (loop->command_run && loop->now - loop->command_run < loop->window) {
+        loop->command_due = 1;
+        return;
+    }
+    stop_command();
+    start_command(loop->config->command);
+    loop->command_run = loop->now;
+    loop->command_due = 0;
+}
 
 static const char *describe(uint32_t mask) {
     return mask & IN_MODIFY ? "Modified" :
@@ -1286,25 +1327,55 @@ static const char *describe(uint32_t mask) {
            mask & IN_IGNORED ? "Watch removed" : "Unknown";
 }
 
+// Note that the file watched by wd has events deferred: mask
+static void defer(sqwatch_config *config, watch_entry *entry, uint32_t mask) {
+    if (!entry->pending) {
+        if (config->pending_count == config->pending_size) {
+            size_t new_size = config->pending_size ? config->pending_size * 2 : 16;
+            int *grown = realloc(config->pending, new_size * sizeof(*grown));
+            if (!grown) {
+                fprintf(stderr, RED "+ Out of memory, a change may not be shown\n" RESET);
+                return;
+            }
+            config->pending = grown;
+            config->pending_size = new_size;
+        }
+        config->pending[config->pending_count++] = entry->wd;
+    }
+    entry->pending |= mask;
+}
+
 // The file watched by wd changed: it is reached as path, read through
-// io_path. Run the command, say so unless quiet, and diff the file, unless
-// this falls in the debounce window and is not forced. A diff is made for a
-// modification; mask IN_IGNORED stands for a file found changed without an
-// event of its own
+// io_path. Say so unless quiet, run the command and diff the file. Each file
+// has a debounce window of its own: a change inside it, unless forced, is
+// deferred to when it closes, and then handled with any others that came
+// meanwhile, if the file changed since (see run_due()). A diff is made for a modification; mask IN_IGNORED stands for a
+// file found changed without an event of its own
 static void fire_file(event_loop *loop, int wd, const char *path, const char *io_path,
                       uint32_t mask, int quiet, int force) {
     sqwatch_config *config = loop->config;
-    if (loop->now - loop->last_event < config->debounce_t && !force) {
+    watch_entry *entry = watch_find(&config->watches, wd);
+    if (!entry) {
         return;
     }
-    stop_command();
-    if (!quiet) {
+    if (!force && entry->last_fire && loop->now - entry->last_fire < loop->window) {
+        defer(config, entry, mask);
+        return;
+    }
+    mask |= entry->pending;
+    entry->pending = 0;
+    entry->last_fire = loop->now;
+    struct stat st;
+    if (stat(io_path, &st) == 0) {
+        entry->fired_ctime = st.st_ctim;
+        entry->fired_size = st.st_size;
+    }
+    if (!quiet || (mask & ~IN_IGNORED)) {
         printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET, shown_name(path), describe(mask));
     }
-    start_command(config->command);
+    run_command(loop);
 
-    watch_entry *entry = watch_find(&config->watches, wd);
-    if (cache_dir && config->diff_enabled && entry && (mask & (IN_MODIFY | IN_IGNORED))) {
+    if (cache_dir && config->diff_enabled && (mask & (IN_MODIFY | IN_IGNORED))) {
         stop_if_signalled();
         // A file without an entry (its copy failed) gets one now; run_diff()
         // then reports it as new
@@ -1317,7 +1388,69 @@ static void fire_file(event_loop *loop, int wd, const char *path, const char *io
                      config->log_file);
         }
     }
-    loop->last_event = loop->now;
+}
+
+// Handle the deferred events whose debounce window has closed, and the
+// deferred command run. Returns the ms until the next of them is due, or -1
+// if none is
+static int run_due(event_loop *loop) {
+    sqwatch_config *config = loop->config;
+    long long next = -1;
+    size_t kept = 0;
+    loop->now = now_ms();
+    for (size_t i = 0; i < config->pending_count; i++) {
+        int wd = config->pending[i];
+        watch_entry *entry = watch_find(&config->watches, wd);
+        if (!entry || !entry->pending) {
+            continue;  // Dropped, or handled already
+        }
+        long long due = entry->last_fire + loop->window;
+        if (due > loop->now) {
+            config->pending[kept++] = wd;
+            next = next < 0 || due < next ? due : next;
+            continue;
+        }
+        int n;
+        int fd = open_entry(config, entry, &n);
+        char *path = fd == -1 ? NULL : strdup(entry->names[n].path);
+        struct stat st;
+        // Events that came after the change was handled but belong to it (a
+        // close after the write) leave nothing new to show
+        if (path && fstat(fd, &st) == 0 && st.st_size == entry->fired_size &&
+            st.st_ctim.tv_sec == entry->fired_ctime.tv_sec &&
+            st.st_ctim.tv_nsec == entry->fired_ctime.tv_nsec) {
+            free(path);
+            path = NULL;
+        }
+        if (path) {
+            char io_path[FD_PATH_LEN];
+            fire_file(loop, wd, path, fd_path(fd, io_path, sizeof(io_path)), entry->pending, 0, 1);
+        } else {
+            entry->pending = 0;  // Unchanged, or not reachable any more
+        }
+        free(path);
+        if (fd != -1) {
+            close(fd);
+        }
+    }
+    config->pending_count = kept;
+    flush_command(loop);
+    if (loop->command_due) {
+        long long due = loop->command_run + loop->window;
+        if (due <= loop->now) {
+            loop->command_due = 0;
+            loop->command_run = 0;
+            loop->command_wanted = 1;
+            flush_command(loop);
+        } else {
+            next = next < 0 || due < next ? due : next;
+        }
+    }
+    if (next < 0) {
+        return -1;
+    }
+    long long wait = next - loop->now;
+    return wait > 60000 ? 60000 : (int)wait;
 }
 
 // An event on the watch of a file. It is handled under the first of the
@@ -1472,14 +1605,11 @@ static void on_dir_event(event_loop *loop, int wd, const struct inotify_event *e
     }
 
     // Directory watches always carry DIR_WATCH_EVENTS to follow the tree;
-    // only run the command for the events that were asked for. These are
-    // debounced on their own so they cannot swallow a write to a new file
-    // that follows
-    if (asked && exists && loop->now - loop->last_create >= config->debounce_t) {
-        stop_command();
+    // only run the command for the events that were asked for. Each of them
+    // is shown; command runs are coalesced (see run_command())
+    if (asked && exists) {
         printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET, shown_name(full_path), describe(asked));
-        start_command(config->command);
-        loop->last_create = loop->now;
+        run_command(loop);
     }
 }
 
@@ -1529,8 +1659,7 @@ static void rescan(event_loop *loop) {
     free(stale);
 
     if (!config->diff_enabled || !cache_dir) {
-        stop_command();
-        start_command(config->command);
+        run_command(loop);
         return;
     }
     size_t files;
@@ -1590,11 +1719,12 @@ static void diff_changed(event_loop *loop) {
 // return that signal
 int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
     char buffer[BUF_LEN];
-    event_loop loop = {inotify_fd, config, 0, 0, 0};
+    event_loop loop = {inotify_fd, config, 0, (long long)config->debounce_t * 1000, 0, 0, 0};
 
     while (1) {
         struct pollfd fds[2] = {{inotify_fd, POLLIN, 0}, {signal_fd, POLLIN, 0}};
-        if (poll(fds, 2, -1) == -1) {
+        int timeout = run_due(&loop);
+        if (poll(fds, 2, timeout) == -1) {
             if (errno == EINTR) {
                 continue;
             }
@@ -1619,7 +1749,6 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
             exit(EXIT_FAILURE);
         }
 
-        loop.now = time(NULL);
         size_t i = 0;
         while (i + EVENT_SIZE <= (size_t)length) {
             // A buffer of events can take long to handle: leave between them
@@ -1629,6 +1758,7 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
             i += EVENT_SIZE + event->len;
             struct inotify_event *next = i + EVENT_SIZE <= (size_t)length ?
                 (struct inotify_event *)&buffer[i] : NULL;
+            loop.now = now_ms();
 
             if (event->wd < 0) {
                 if (event->mask & IN_Q_OVERFLOW) {
@@ -1645,6 +1775,7 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
             }
             diff_changed(&loop);
         }
+        flush_command(&loop);
     }
 }
 

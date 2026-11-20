@@ -23,6 +23,7 @@ int cache_differs(const char *io_path, const char *path);
 void remove_caches(void);
 int create_caches(const char *cache_dir);
 int open_log_file(const char *log_file);
+int is_log_file(int fd);
 FILE *log_begin(void);
 void log_end(void);
 void create_cache_for_file(const char *path, const char *io_path, const char *cache_dir,
