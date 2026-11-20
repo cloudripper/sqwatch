@@ -76,7 +76,7 @@ Watch:
 - `-i PATTERN`: Ignore what matches PATTERN (repeatable). An ignored directory is not watched and not walked; an ignored file never triggers the command, is never diffed and never cached. PATTERN is a shell pattern (see `fnmatch(3)`). A PATTERN with a `/` is matched against the path below the watched directory (`/` is only matched by `/`), any other against the name alone; a trailing `/` is dropped. For example `-i '*.o' -i build/tmp`. Always ignored: `.git`, and sqwatch's own log file and cache directory when they are inside a watched tree. Ignores apply at startup, to entries created or moved in later, and when the tree is walked again after lost events
 
 Command:
-- `-c COMMAND`: Run COMMAND with `/bin/sh -c` on each change; a run still going is stopped and started again
+- `-c COMMAND`: Run COMMAND with `/bin/sh -c` on each change; a run still going is stopped and started again. Without `-c`, sqwatch runs in observe mode: it shows every event (and diff, with `--diff`) and runs nothing, with no debounce unless `-t` is given; `-w` and `-s` then only draw a warning
 - `-w`: Wait for a run still going to end instead of stopping it. The changes that come while it runs lead to exactly one more run, started once it has exited (its first process, the shell). Without `-w` a run still going is stopped and the command started again
 - `-s SIGNAL`: Signal that stops a run, on a restart and when sqwatch exits: a name, with or without `SIG`, in any case (`TERM`, `sigint`, `RTMIN+2`), or a number (default: `TERM`). What is left of the run's process group gets `KILL` 2 s later on a restart, 5 s later (or at a second signal to sqwatch) on exit. `STOP`, `TSTP`, `TTIN` and `TTOU` are refused, as they would pause the command instead of stopping it, and so is `CONT`, which stops nothing
 - The command gets the change that started it in its environment, never in the command string:
@@ -84,7 +84,9 @@ Command:
   - `SQWATCH_EVENT`: `modify`, `create`, `delete`, `move` or `attrib`; `overflow`, with an empty `SQWATCH_PATH`, when events were lost and the tree was walked again without `--diff`
 
   Quote them: `sqwatch -d src -c 'echo "changed: $SQWATCH_PATH ($SQWATCH_EVENT)"'`. When changes come together (in one batch of events, or inside the debounce window of the last run), they lead to one run, and that run gets the latest of them.
-- `-t SECONDS`: Debounce time of each file, a decimal number of seconds such as `2` or `0.25`, from 0 to 86400 (default: 1)
+- `-t SECONDS`: Debounce time of each file, a decimal number of seconds such as `2` or `0.25`, from 0 to 86400 (default: 1, or 0 in observe mode)
+
+sqwatch writes its output a line at a time, whether to a terminal, a pipe or a file, and flushes it before it starts the command, so that its lines and the command's stay in order and none is written twice.
 
 Diff:
 - `--diff`: Show what changed in each file, from a private cache

@@ -1290,6 +1290,9 @@ static void start_command(const char *command, const char *path, const char *eve
         sigaddset(&block, SIGHUP);
         sigprocmask(SIG_BLOCK, &block, &prev);
 
+        // Nothing sqwatch has buffered may be written by the child as well
+        fflush(stdout);
+        fflush(stderr);
         g_last_pid = fork();
         if (g_last_pid == -1) {
             // Out of processes for now: this run is skipped, the watch goes on
@@ -1928,13 +1931,15 @@ void print_usage(void) {
            "\n"
            "Command:\n"
            "  -c COMMAND     Run COMMAND with /bin/sh -c on each change; a run still going\n"
-           "                 is stopped and started again\n"
+           "                 is stopped and started again. Without -c sqwatch only shows\n"
+           "                 events and diffs (observe mode), with no debounce unless -t\n"
            "  -w             Wait for a run still going to end instead of stopping it;\n"
            "                 the changes that come meanwhile lead to one more run after it\n"
            "  -s SIGNAL      Signal that stops a run: a name, with or without SIG, or a\n"
            "                 number (default: TERM). What is left of the run gets KILL\n"
            "                 2 s later on a restart, 5 s later when sqwatch exits\n"
-           "  -t SECONDS     Debounce time of each file, a decimal number (default: 1)\n"
+           "  -t SECONDS     Debounce time of each file, a decimal number (default: 1,\n"
+           "                 or 0 without -c)\n"
            "                 The command gets the change in its environment: SQWATCH_PATH,\n"
            "                 the path, and SQWATCH_EVENT: modify, create, delete, move,\n"
            "                 attrib (overflow, with an empty path, after lost events).\n"

@@ -348,6 +348,9 @@ int main(int argc, char *argv[]) {
   // of sqwatch rather than of init, so cleanup() and stop_command() can reap
   // them and know when the command's process group is really empty
   prctl(PR_SET_CHILD_SUBREAPER, 1);
+  // Each line is written as it is made, to a terminal, a pipe or a file
+  // alike, so that what sqwatch and the command print stays in order
+  setvbuf(stdout, NULL, _IOLBF, 0);
   char *command = NULL;
   // Every -d and -f, each of them one argument at least
   char **paths = calloc(argc, sizeof(*paths));
@@ -490,7 +493,22 @@ int main(int argc, char *argv[]) {
   if (!flags) {
     flags = IN_MODIFY | IN_CLOSE_WRITE;  // -q modify
   }
+  if (!command) {
+    // Observe mode: every event is shown, so no debounce unless asked for
+    if (!config.debounce_set) {
+      debounce_ms = 0;
+    }
+    if (config.wait) {
+      fprintf(stderr, "sqwatch: warning: -w has no effect without -c\n");
+    }
+    if (stop_signal) {
+      fprintf(stderr, "sqwatch: warning: -s has no effect without -c\n");
+    }
+  }
   announce_events(flags);
+  if (!command) {
+    printf(DARK_GREY "+ No command (-c): showing events only\n" RESET);
+  }
   if (config.debounce_set) {
     printf(DARK_GREY "+ Debounce set to %s s\n" RESET, format_seconds(debounce_ms));
   }
