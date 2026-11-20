@@ -30,12 +30,7 @@ static void cleanup(int signo) {
   // Wipe the cache directory if it exists
   if (cache_dir && cache_dir_owned) {
     printf(RED "+ Wiping cache directory: %s\n" RESET, cache_dir);
-    // Empty the directory that was created and checked, not whatever the
-    // path names now; then remove the name if it is an empty directory
-    char io_path[32];
-    snprintf(io_path, sizeof(io_path), "/proc/self/fd/%d", cache_dir_fd);
-    remove_directory(io_path);
-    rmdir(cache_dir);
+    remove_caches();
   }
 
   free(cache_dir);
@@ -170,8 +165,9 @@ int main(int argc, char *argv[]) {
         printf(DARK_GREY "+ Cache set. Using SQWATCH_CACHE_DIR: %s\n" RESET,
                cache_dir);
       } else {
+        // The XDG spec says to ignore an empty or relative XDG_CACHE_HOME
         const char *xdg_cache_home = getenv("XDG_CACHE_HOME");
-        if (!xdg_cache_home) {
+        if (!xdg_cache_home || xdg_cache_home[0] != '/') {
           xdg_cache_home = getenv("HOME");
           if (xdg_cache_home) {
             if (asprintf(&cache_dir, "%s/.cache/sqwatch", xdg_cache_home) < 0) {

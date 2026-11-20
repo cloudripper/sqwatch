@@ -17,7 +17,7 @@ extern int cache_dir_fd;
 int open_cache_file(const char *path, int flags);
 int copy_file(const char *src, const char *dest);
 int unlink_cache_file(const char *path);
-void remove_directory(const char *path);
+void remove_caches(void);
 int create_caches(const char *cache_dir);
 void create_cache_for_file(const char *path, const char *io_path, const char *cache_dir,
                           char **cached_path, int verbose);
