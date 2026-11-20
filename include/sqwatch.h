@@ -102,6 +102,7 @@ typedef struct {
     int root_count;
     long long debounce_ms;   // The debounce time
     int debounce_set;        // Given with -t
+    int wait;                // -w: let a running command finish
     int verbose;
     int diff_enabled;        // New flag for diff functionality
     const char *log_file;

@@ -77,6 +77,7 @@ Watch:
 
 Command:
 - `-c COMMAND`: Run COMMAND with `/bin/sh -c` on each change; a run still going is stopped and started again
+- `-w`: Wait for a run still going to end instead of stopping it. The changes that come while it runs lead to exactly one more run, started once it has exited (its first process, the shell). Without `-w` a run still going is stopped and the command started again
 - The command gets the change that started it in its environment, never in the command string:
   - `SQWATCH_PATH`: the path of the file or directory, as sqwatch shows it (relative to the `-d` or `-f` path given), byte for byte
   - `SQWATCH_EVENT`: `modify`, `create`, `delete`, `move` or `attrib`; `overflow`, with an empty `SQWATCH_PATH`, when events were lost and the tree was walked again without `--diff`

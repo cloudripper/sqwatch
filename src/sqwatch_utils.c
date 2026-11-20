@@ -1329,6 +1329,7 @@ typedef struct {
     long long command_run;   // When the command was last started; 0 if never
     int command_wanted;      // A run was asked for while handling events
     int command_due;         // A run is to be made when the window closes
+    int rerun;               // -w: a run waits for the running one to end
     char *command_path;      // The latest change a run was asked for: what
     const char *command_event;  // the run gets as SQWATCH_PATH and _EVENT
 } event_loop;
@@ -1353,8 +1354,16 @@ static void run_command(event_loop *loop, const char *path, const char *event) {
     loop->command_wanted = 1;
 }
 
+// Whether the command started last is still running: its first process,
+// the shell, has not exited
+static int command_running(void) {
+    return g_last_pid > 0 && waitpid(g_last_pid, NULL, WNOHANG) == 0;
+}
+
 // Make the run asked for. Runs are coalesced: inside the debounce window of
-// the last run, one more is made when the window closes (see run_due())
+// the last run, one more is made when the window closes (see run_due()).
+// With -w a command still running is not stopped: one more run is made once
+// it has exited, however many changes come meanwhile
 static void flush_command(event_loop *loop) {
     if (!loop->command_wanted) {
         return;
@@ -1364,6 +1373,11 @@ static void flush_command(event_loop *loop) {
         loop->command_due = 1;
         return;
     }
+    if (loop->config->wait && command_running()) {
+        loop->rerun = 1;
+        return;
+    }
+    loop->rerun = 0;
     stop_command();
     start_command(loop->config->command, loop->command_path, loop->command_event);
     loop->command_run = loop->now;
@@ -1505,6 +1519,13 @@ static int run_due(event_loop *loop) {
         }
     }
     config->pending_count = kept;
+    if (loop->rerun) {
+        if (command_running()) {
+            next = next < 0 || loop->now + 50 < next ? loop->now + 50 : next;
+        } else {
+            loop->command_wanted = 1;
+        }
+    }
     flush_command(loop);
     if (loop->command_due) {
         long long due = loop->command_run + loop->window;
@@ -1812,7 +1833,7 @@ static void diff_changed(event_loop *loop) {
 // signal_fd, and return that signal; SIGTERM if the events cannot be read
 int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
     char buffer[BUF_LEN];
-    event_loop loop = {inotify_fd, config, 0, config->debounce_ms, 0, 0, 0, NULL, NULL};
+    event_loop loop = {inotify_fd, config, 0, config->debounce_ms, 0, 0, 0, 0, NULL, NULL};
 
     while (1) {
         // stdout is polled for an error only: its reader went away
@@ -1901,6 +1922,8 @@ void print_usage(void) {
            "Command:\n"
            "  -c COMMAND     Run COMMAND with /bin/sh -c on each change; a run still going\n"
            "                 is stopped and started again\n"
+           "  -w             Wait for a run still going to end instead of stopping it;\n"
+           "                 the changes that come meanwhile lead to one more run after it\n"
            "  -t SECONDS     Debounce time of each file, a decimal number (default: 1)\n"
            "                 The command gets the change in its environment: SQWATCH_PATH,\n"
            "                 the path, and SQWATCH_EVENT: modify, create, delete, move,\n"

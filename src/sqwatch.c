@@ -311,7 +311,7 @@ int main(int argc, char *argv[]) {
   // Errors are reported here, not by getopt: a leading ':' tells a missing
   // argument from an unknown option
   opterr = 0;
-  while ((opt = getopt_long(argc, argv, ":d:f:t:q:c:l:i:vh", long_options, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, ":d:f:t:q:c:l:i:wvh", long_options, NULL)) != -1) {
     struct stat statbuf;
     switch (opt) {
     case 'd':
@@ -377,6 +377,9 @@ int main(int argc, char *argv[]) {
       break;
     case 'D':
       config.diff_enabled = 1;
+      break;
+    case 'w':
+      config.wait = 1;
       break;
     case 'v':
       verbose = 1;
