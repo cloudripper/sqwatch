@@ -174,6 +174,37 @@ int copy_file(const char *src, const char *dest, const char *shown_path) {
   return 0;
 }
 
+// Whether the watched file read through io_path differs from the cache entry
+// path: 1 if it does or either cannot be read, 0 if they are the same
+int cache_differs(const char *io_path, const char *path) {
+  int src_fd = open_watched_file(io_path);
+  int cache_fd = src_fd < 0 ? -1 : open_cache_file(path, O_RDONLY);
+  struct stat src_st, cache_st;
+  int differs = src_fd < 0 || cache_fd < 0 || fstat(src_fd, &src_st) != 0 ||
+                fstat(cache_fd, &cache_st) != 0 || src_st.st_size != cache_st.st_size;
+  while (!differs) {
+    char a[65536], b[sizeof(a)];
+    ssize_t n = read(src_fd, a, sizeof(a));
+    if (n <= 0) {
+      differs = n < 0;
+      break;
+    }
+    ssize_t got = 0, m = 0;
+    while (got < n && (m = read(cache_fd, b + got, n - got)) > 0) {
+      got += m;
+    }
+    differs = got != n || memcmp(a, b, n) != 0;
+    stop_if_signalled();
+  }
+  if (src_fd >= 0) {
+    close(src_fd);
+  }
+  if (cache_fd >= 0) {
+    close(cache_fd);
+  }
+  return differs;
+}
+
 int unlink_cache_file(const char *path) {
   return unlinkat(cache_dir_fd, cache_name(path), 0);
 }

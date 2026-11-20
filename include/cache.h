@@ -19,6 +19,7 @@ int open_watched_file(const char *io_path);
 int copy_file(const char *src, const char *dest, const char *shown_path);
 char *cache_new_entry(const char *cache_dir);
 int unlink_cache_file(const char *path);
+int cache_differs(const char *io_path, const char *path);
 void remove_caches(void);
 int create_caches(const char *cache_dir);
 int open_log_file(const char *log_file);
