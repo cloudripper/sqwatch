@@ -112,8 +112,8 @@ static const char *option_help(int opt) {
   case 'f': return "-f FILE: an existing regular file";
   case 'c': return "-c COMMAND: a shell command, run with /bin/sh -c";
   case 't': return "-t SECONDS: a decimal number of seconds from 0 to 86400, for example 1 or 0.25";
-  case 'q': return "-q EVENTS: one or more of modify, create, delete, move, attrib, all,\n"
-                   "  separated by commas, for example -q modify,create";
+  case 'q': return "-q EVENTS: one or more of modify, create, delete, move, attrib, open,\n"
+                   "  access, all, separated by commas, for example -q modify,create";
   case 'l': return "-l FILE: the log file for diffs (with --diff)";
   case 's': return "-s SIGNAL: a name, with or without SIG, in any case, or a number:\n"
                    "  HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM\n"
@@ -280,6 +280,8 @@ static uint32_t parse_events(const char *list, const char **problem) {
     {"delete", IN_DELETE},
     {"move", IN_MOVE},
     {"attrib", IN_ATTRIB},
+    {"open", IN_OPEN},
+    {"access", IN_ACCESS},
     {"all", IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVE | IN_ATTRIB | IN_CLOSE_WRITE},
   };
   static char why[64];
@@ -316,7 +318,7 @@ static void announce_events(uint32_t flags) {
     uint32_t mask;
   } names[] = {
     {"modify", IN_MODIFY}, {"create", IN_CREATE}, {"delete", IN_DELETE},
-    {"move", IN_MOVE}, {"attrib", IN_ATTRIB},
+    {"move", IN_MOVE}, {"attrib", IN_ATTRIB}, {"open", IN_OPEN}, {"access", IN_ACCESS},
   };
   printf(GREEN "+ Monitoring events:");
   for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); n++) {
@@ -565,6 +567,7 @@ int main(int argc, char *argv[]) {
   config.log_file = log_file;
   config.command = command;
   config.flags = flags;
+  config.inotify_fd = inotify_fd;
 
   // Watches are set and files are read through /proc/self/fd/N so that they
   // act on an already opened descriptor instead of resolving a path again

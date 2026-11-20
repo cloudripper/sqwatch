@@ -289,6 +289,35 @@ static const char *fd_path(int fd, char *buf, size_t size) {
     return buf;
 }
 
+// The events a file watch carries: those asked for, and with open or access
+// both close events, so that two opens or reads in a row are never merged
+// into one by the kernel (it merges an event with the same one queued just
+// before it)
+static uint32_t file_watch_mask(uint32_t flags) {
+    return flags | (flags & (IN_OPEN | IN_ACCESS) ? IN_CLOSE_WRITE | IN_CLOSE_NOWRITE : 0);
+}
+
+// The events a directory watch carries: none about reads (an open in a
+// directory is reported by the file's own watch), and DIR_WATCH_EVENTS
+static uint32_t dir_watch_mask(uint32_t flags) {
+    return (flags & ~(IN_OPEN | IN_ACCESS | IN_CLOSE_NOWRITE)) | DIR_WATCH_EVENTS;
+}
+
+#define READ_EVENTS (IN_OPEN | IN_ACCESS | IN_CLOSE_NOWRITE)
+
+// sqwatch's own reads of a watched file (its copies, diffs and checks) must
+// not show up as opens or accesses. With -q open or -q access, the watch of
+// the file read through io_path, which must exist, drops the read events
+// (quiet set) before such a read and gets them back after it. The kernel then
+// queues no event for these reads at all; the price is that another process
+// reading the same file in that moment is not seen either
+static void own_reads(const sqwatch_config *config, const char *io_path, int quiet) {
+    if (config->flags & (IN_OPEN | IN_ACCESS)) {
+        uint32_t mask = file_watch_mask(config->flags);
+        inotify_add_watch(config->inotify_fd, io_path, quiet ? mask & ~READ_EVENTS : mask);
+    }
+}
+
 // Watch exactly the inode fd refers to. The /proc link has to be followed to
 // get there, so IN_DONT_FOLLOW must not be set
 static int add_watch_fd(int inotify_fd, int fd, uint32_t flags) {
@@ -678,8 +707,10 @@ static watch_entry *attach_name(int inotify_fd, sqwatch_config *config, int wd, 
       int other = open_entry(config, before, &n);
       if (other != -1) {
         char io_path[FD_PATH_LEN];
-        create_cache_for_file(before->names[n].path, fd_path(other, io_path, sizeof(io_path)),
-                              cache_dir, &fresh, 0);
+        fd_path(other, io_path, sizeof(io_path));
+        own_reads(config, io_path, 1);
+        create_cache_for_file(before->names[n].path, io_path, cache_dir, &fresh, 0);
+        own_reads(config, io_path, 0);
       }
       if (other != -1) {
         close(other);
@@ -765,14 +796,16 @@ static void watch_file(int inotify_fd, int parent_fd, const char *name, const ch
         close(fd);
         return;
     }
-    int wd = fd == -1 ? -1 : add_watch_fd(inotify_fd, fd, flags);
+    int wd = fd == -1 ? -1 : add_watch_fd(inotify_fd, fd, file_watch_mask(flags));
     int added = 0;
     watch_entry *entry = wd < 0 ? NULL :
         attach_name(inotify_fd, config, wd, fd, 0, path, root, &added);
     if (entry && at_runtime && config->diff_enabled && cache_dir && !entry->cached) {
         char io_path[FD_PATH_LEN];
-        create_cache_for_file(path, fd_path(fd, io_path, sizeof(io_path)), cache_dir,
-                              &entry->cached, config->verbose);
+        fd_path(fd, io_path, sizeof(io_path));
+        own_reads(config, io_path, 1);
+        create_cache_for_file(path, io_path, cache_dir, &entry->cached, config->verbose);
+        own_reads(config, io_path, 0);
     }
     if (added && config->verbose) {
         if (at_runtime == 2) {
@@ -789,7 +822,7 @@ static void watch_file(int inotify_fd, int parent_fd, const char *name, const ch
 // Watch the directory dir_fd refers to; path is its displayed path
 static void watch_dir(int inotify_fd, int dir_fd, const char *path, int root, uint32_t flags,
                       sqwatch_config *config) {
-    int wd = add_watch_fd(inotify_fd, dir_fd, flags | DIR_WATCH_EVENTS);
+    int wd = add_watch_fd(inotify_fd, dir_fd, dir_watch_mask(flags));
     int added = 0;
     // A directory watched before (walked again, or reached by another name)
     // gets the wd it already has: its entry is updated
@@ -1194,6 +1227,15 @@ static int *file_watch_list(const watch_table *table, size_t *count) {
     return wds;
 }
 
+// copy_file() as one of sqwatch's own reads
+static int copy_quietly(const sqwatch_config *config, const char *io_path, const char *cached,
+                        const char *path) {
+    own_reads(config, io_path, 1);
+    int result = copy_file(io_path, cached, path);
+    own_reads(config, io_path, 0);
+    return result;
+}
+
 // Copy every watched file into the cache at startup, overwriting what is
 // there. Each file is opened beneath its root and read through that descriptor
 void cache_watched_files(sqwatch_config *config) {
@@ -1230,7 +1272,7 @@ void cache_watched_files(sqwatch_config *config) {
         }
         entry->cached = cache_new_entry(cache_dir);
         if (entry->cached &&
-            copy_file(fd_path(fd, io_path, sizeof(io_path)), entry->cached, path) == 0 &&
+            copy_quietly(config, fd_path(fd, io_path, sizeof(io_path)), entry->cached, path) == 0 &&
             config->verbose) {
             printf(DARK_GREY "+ Cached [%d]: %s\n" RESET, wds[n], shown_name(path));
         }
@@ -1415,6 +1457,7 @@ static const char *describe(uint32_t mask) {
            mask & IN_CLOSE_NOWRITE ? "Closed" :
            mask & IN_OPEN ? "Opened" :
            mask & IN_ATTRIB ? "Attributes" :
+           mask & IN_ACCESS ? "Accessed" :
            mask & IN_DELETE_SELF ? "Self deleted" :
            mask & IN_MOVE_SELF ? "Self moved" :
            mask & IN_UNMOUNT ? "Unmounted" :
@@ -1478,9 +1521,11 @@ static void fire_file(event_loop *loop, int wd, const char *path, const char *io
             entry->cached = cache_new_entry(cache_dir);
         }
         if (entry->cached) {
+            own_reads(config, io_path, 1);
             run_diff(path, io_path, entry->cached, "Modified",
                      1, // diff is always verbose
                      config->log_file);
+            own_reads(config, io_path, 0);
         }
     }
 }
@@ -1605,15 +1650,18 @@ static void on_file_event(event_loop *loop, int wd, uint32_t mask) {
             }
         } else {
             // Another file has this name now, or this one lost its watch
-            int new_wd = add_watch_fd(loop->inotify_fd, fd, config->flags);
+            int new_wd = add_watch_fd(loop->inotify_fd, fd, file_watch_mask(config->flags));
             int added;
             watch_entry *now = new_wd < 0 ? NULL :
                 attach_name(loop->inotify_fd, config, new_wd, fd, 0, names[n].path, names[n].root,
                             &added);
             if (now && !now->cached && config->diff_enabled && cache_dir) {
                 char io_path[FD_PATH_LEN];
-                create_cache_for_file(names[n].path, fd_path(fd, io_path, sizeof(io_path)),
-                                      cache_dir, &now->cached, config->verbose);
+                fd_path(fd, io_path, sizeof(io_path));
+                own_reads(config, io_path, 1);
+                create_cache_for_file(names[n].path, io_path, cache_dir, &now->cached,
+                                      config->verbose);
+                own_reads(config, io_path, 0);
             }
             if (now && config->verbose) {
                 printf(DARK_GREY "+ Reapplied watch for %s\n" RESET, shown_name(names[n].path));
@@ -1635,9 +1683,11 @@ static void on_file_event(event_loop *loop, int wd, uint32_t mask) {
         // Nothing in the watched trees leads to this file any more
         drop_watch(loop->inotify_fd, config, wd, gone, NULL);
     }
-    if (found) {
+    if (found && (mask & config->flags)) {
         char io_path[FD_PATH_LEN];
         fire_file(loop, wd, found, fd_path(found_fd, io_path, sizeof(io_path)), mask, 0, 0);
+    }
+    if (found) {
         close(found_fd);
         free(found);
     }
@@ -1796,7 +1846,14 @@ static void rescan(event_loop *loop) {
         int n;
         int fd = open_entry(config, entry, &n);
         char io_path[FD_PATH_LEN];
-        if (fd != -1 && cache_differs(fd_path(fd, io_path, sizeof(io_path)), entry->cached)) {
+        int differs = 0;
+        if (fd != -1) {
+            fd_path(fd, io_path, sizeof(io_path));
+            own_reads(config, io_path, 1);
+            differs = cache_differs(io_path, entry->cached);
+            own_reads(config, io_path, 0);
+        }
+        if (differs) {
             mark_changed(config, wds[i], CHANGED_RESCAN);
         }
         if (fd != -1) {
@@ -1922,7 +1979,10 @@ void print_usage(void) {
            "                   delete   a file or directory was deleted\n"
            "                   move     a file or directory was moved or renamed\n"
            "                   attrib   mode, owner or times changed\n"
-           "                   all      all of the above\n"
+           "                   open     a file was opened\n"
+           "                   access   a file was read\n"
+           "                   all      all of the above but open and access\n"
+           "                 sqwatch's own reads never count; the command's do\n"
            "  -i PATTERN     Ignore what matches PATTERN (repeatable): not watched, not\n"
            "                 walked, never shown. A PATTERN with a '/' is matched against\n"
            "                 the path below the watched directory, any other against the\n"
@@ -1942,7 +2002,8 @@ void print_usage(void) {
            "                 or 0 without -c)\n"
            "                 The command gets the change in its environment: SQWATCH_PATH,\n"
            "                 the path, and SQWATCH_EVENT: modify, create, delete, move,\n"
-           "                 attrib (overflow, with an empty path, after lost events).\n"
+           "                 attrib, open, access (overflow, with an empty path, after\n"
+           "                 lost events).\n"
            "                 Use them quoted, as \"$SQWATCH_PATH\". When changes come\n"
            "                 together, one run is made, for the latest of them\n"
            "\n"

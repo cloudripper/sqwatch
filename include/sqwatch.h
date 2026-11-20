@@ -88,6 +88,7 @@ typedef struct {
 
 typedef struct {
     watch_table watches;
+    int inotify_fd;
     name_index names;
     unsigned scan;           // Rescans so far
     int creating;            // Watching an entry an IN_CREATE event named
