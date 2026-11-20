@@ -9,8 +9,10 @@
 #include <limits.h>
 #include <linux/magic.h>
 #include <pwd.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <sys/vfs.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -419,70 +421,91 @@ static void empty_directory(int dir_fd) {
   }
 }
 
-static int refuse_cache_dir(const char *cache_dir, const char *where, const char *reason) {
+// Say why the path given for what ("cache directory", "log file") is not used
+static int refuse_path(const char *what, const char *path, const char *where, const char *reason) {
   char shown[PATH_MAX];
   char shown_where[PATH_MAX];
   if (where) {
-    fprintf(stderr, RED "+ Not using cache directory %s: %s: %s\n" RESET,
-            printable(cache_dir, shown, sizeof(shown)),
+    fprintf(stderr, RED "+ Not using %s %s: %s: %s\n" RESET, what,
+            printable(path, shown, sizeof(shown)),
             printable(where, shown_where, sizeof(shown_where)), reason);
   } else {
-    fprintf(stderr, RED "+ Not using cache directory %s: %s\n" RESET,
-            printable(cache_dir, shown, sizeof(shown)), reason);
+    fprintf(stderr, RED "+ Not using %s %s: %s\n" RESET, what,
+            printable(path, shown, sizeof(shown)), reason);
   }
   return -1;
 }
 
-// Set up the cache directory. Returns 0 if it can be used, -1 otherwise. The
-// cache holds copies of the watched files, so a directory that is not the
-// user's own, or that others can write to, is refused. Its parent is opened
-// with open_trusted_dir() and the directory is made and opened beneath it, by
-// name. It is checked through the descriptor every later cache access goes
-// through. The watched files are copied in by cache_watched_files()
-int create_caches(const char *cache_dir) {
-  if (!cache_dir) {
-    return -1;
+// Open the directory that is to hold the last component of path with
+// open_trusted_dir(), and point *leaf at that component, copied into buf. The
+// last component has to be a name in the parent: a trailing "/" or "/." would
+// make the kernel follow a symlink there. A trailing "/" is dropped from a
+// directory's path and refused in a file's (is_dir 0). A relative path is
+// checked from / down too. Returns the parent's descriptor, or -1 once it has
+// said why
+static int open_trusted_parent(const char *what, const char *path, int is_dir, char *buf,
+                               size_t size, const char **leaf) {
+  int len = snprintf(buf, size, "%s", path);
+  if (len >= (int)size) {
+    return refuse_path(what, path, NULL, strerror(ENAMETOOLONG));
+  }
+  if (!is_dir && len > 0 && buf[len - 1] == '/') {
+    return refuse_path(what, path, NULL, "the path must end in a file name");
+  }
+  while (len > 1 && buf[len - 1] == '/') {
+    buf[--len] = '\0';
+  }
+  char *slash = strrchr(buf, '/');
+  *leaf = slash ? slash + 1 : buf;
+  if (**leaf == '\0' || strcmp(*leaf, ".") == 0 || strcmp(*leaf, "..") == 0) {
+    return refuse_path(what, path, NULL, is_dir ? "the path must end in a directory name" :
+                                                  "the path must end in a file name");
   }
 
-  // The last component has to be a name in the parent: a trailing "/" or
-  // "/." would make the kernel follow a symlink there
-  char path[PATH_MAX];
-  int len = snprintf(path, sizeof(path), "%s", cache_dir);
-  if (len >= (int)sizeof(path)) {
-    return refuse_cache_dir(cache_dir, NULL, strerror(ENAMETOOLONG));
-  }
-  while (len > 1 && path[len - 1] == '/') {
-    path[--len] = '\0';
-  }
-  char *slash = strrchr(path, '/');
-  const char *leaf = slash ? slash + 1 : path;
-  if (*leaf == '\0' || strcmp(leaf, ".") == 0 || strcmp(leaf, "..") == 0) {
-    return refuse_cache_dir(cache_dir, NULL, "the path must end in a directory name");
-  }
-
-  // A relative path is checked from / down too
   char parent[PATH_MAX];
   char cwd[PATH_MAX];
   if (slash) {
     *slash = '\0';
   }
-  if (cache_dir[0] == '/') {
-    len = snprintf(parent, sizeof(parent), "/%s", path);
+  if (path[0] == '/') {
+    len = snprintf(parent, sizeof(parent), "/%s", buf);
   } else if (getcwd(cwd, sizeof(cwd))) {
-    len = snprintf(parent, sizeof(parent), "%s/%s", cwd, slash ? path : "");
+    len = snprintf(parent, sizeof(parent), "%s/%s", cwd, slash ? buf : "");
   } else {
-    return refuse_cache_dir(cache_dir, NULL, errno == ERANGE ?
-                            "the current directory path is too long" : strerror(errno));
+    return refuse_path(what, path, NULL, errno == ERANGE ?
+                       "the current directory path is too long" : strerror(errno));
   }
   if (len >= (int)sizeof(parent)) {
-    return refuse_cache_dir(cache_dir, NULL, strerror(ENAMETOOLONG));
+    return refuse_path(what, path, NULL, strerror(ENAMETOOLONG));
   }
 
   char where[PATH_MAX];
   const char *reason = NULL;
   int parent_fd = open_trusted_dir(parent, where, sizeof(where), &reason);
   if (parent_fd < 0) {
-    return refuse_cache_dir(cache_dir, where, reason);
+    return refuse_path(what, path, where, reason);
+  }
+  return parent_fd;
+}
+
+// Set up the cache directory. Returns 0 if it can be used, -1 otherwise. The
+// cache holds copies of the watched files, so a directory that is not the
+// user's own, or that others can write to, is refused. Its parent is opened
+// with open_trusted_parent() and the directory is made and opened beneath it,
+// by name. It is checked through the descriptor every later cache access goes
+// through. The watched files are copied in by cache_watched_files()
+int create_caches(const char *cache_dir) {
+  if (!cache_dir) {
+    return -1;
+  }
+
+  char path[PATH_MAX];
+  const char *leaf;
+  const char *reason = NULL;
+  int parent_fd = open_trusted_parent("cache directory", cache_dir, 1, path, sizeof(path),
+                                      &leaf);
+  if (parent_fd < 0) {
+    return -1;
   }
 
   int created = mkdirat(parent_fd, leaf, 0700) == 0;
@@ -509,7 +532,7 @@ int create_caches(const char *cache_dir) {
       close(fd);
     }
     close(parent_fd);
-    return refuse_cache_dir(cache_dir, NULL, reason);
+    return refuse_path("cache directory", cache_dir, NULL, reason);
   }
 
   cache_dir_fd = fd;
@@ -523,6 +546,276 @@ int create_caches(const char *cache_dir) {
             printable(cache_dir, shown, sizeof(shown)));
   }
   return 0;
+}
+
+// The log given with -l. A regular file is kept with the descriptor of its
+// checked parent and its name, so that it can be opened again there when it
+// is rotated or removed; anything else (a terminal, /dev/null, a pipe from
+// /dev/stdout or /dev/fd/N, a FIFO) is kept open as it is
+FILE *log_stream = NULL;
+static const char *log_given;            // the path as given, for messages
+static int log_parent_fd = -1;           // regular file only: checked parent
+static char log_leaf[NAME_MAX + 1];      // regular file only: name in it
+static int log_is_pipe;                  // FIFO or pipe: SIGPIPE held
+static int log_broken;                   // the reader of the pipe went away
+static sigset_t log_prev_mask;
+
+static int owned_by_root_or_me(const struct stat *st) {
+  return st->st_uid == 0 || st->st_uid == root_uid || st->st_uid == geteuid();
+}
+
+// Open leaf beneath parent_fd for appending. A FIFO with no reader yet is
+// waited for, as v0.4.1 did, but in steps, so that SIGINT and SIGTERM are
+// still answered. Returns a descriptor, or -1 with errno set
+static int open_log_at(int parent_fd, const char *leaf, int flags, int is_fifo) {
+  int fd = openat(parent_fd, leaf, flags | O_WRONLY | O_APPEND | O_NONBLOCK | O_CLOEXEC, 0600);
+  for (int waited = 0; fd < 0 && errno == ENXIO && is_fifo; waited++) {
+    if (waited == 0) {
+      char shown[PATH_MAX];
+      fprintf(stderr, DARK_GREY "+ Waiting for a reader of the log FIFO %s\n" RESET,
+              printable(log_given, shown, sizeof(shown)));
+    }
+    stop_if_signalled();
+    usleep(100000);
+    fd = openat(parent_fd, leaf, flags | O_WRONLY | O_APPEND | O_NONBLOCK | O_CLOEXEC, 0600);
+  }
+  return fd;
+}
+
+// Why the regular file fd, the log, cannot be used; NULL if it can. It must be
+// the user's, have no other name and not be writable by anyone else. It holds
+// diffs of the watched files, so a looser mode is made 0600, and said
+static const char *regular_log_problem(int fd, const struct stat *st) {
+  if (st->st_uid != geteuid()) {
+    return "it is owned by another user";
+  }
+  if (st->st_nlink != 1) {
+    return "it has another name (a hard link)";
+  }
+  if (others_can_write(fd, st)) {
+    return "other users can write to it";
+  }
+  if ((st->st_mode & 07777) != 0600) {
+    if (fchmod(fd, 0600) != 0) {
+      return strerror(errno);
+    }
+    char shown[PATH_MAX];
+    fprintf(stderr, DARK_GREY "+ Log file %s had mode %04o; made it 0600, as it holds diffs of watched files\n" RESET,
+            printable(log_given, shown, sizeof(shown)), (unsigned)(st->st_mode & 07777));
+  }
+  return NULL;
+}
+
+// Open the regular file, FIFO or device leaf beneath its checked parent,
+// creating a regular file if there is none. Returns a descriptor, or -1 with
+// *why set
+static int open_log_leaf(int parent_fd, const char *leaf, const char **why) {
+  struct stat st;
+  int is_fifo = fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISFIFO(st.st_mode);
+  if (is_fifo && !owned_by_root_or_me(&st)) {
+    *why = "it is a FIFO owned by another user";
+    return -1;
+  }
+  int fd = open_log_at(parent_fd, leaf, O_CREAT | O_NOFOLLOW, is_fifo);
+  if (fd < 0) {
+    *why = errno == ELOOP ? "it is a symlink" :
+           errno == EISDIR ? "it is a directory" :
+           errno == ENXIO ? "it is a socket" : strerror(errno);
+    return -1;
+  }
+  *why = NULL;
+  if (fstat(fd, &st) != 0) {
+    *why = strerror(errno);
+  } else if (S_ISREG(st.st_mode)) {
+    *why = regular_log_problem(fd, &st);
+  } else if (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode)) {
+    // Anyone may make a FIFO in a sticky directory and read the diffs from it
+    if (!owned_by_root_or_me(&st)) {
+      *why = "it is a FIFO owned by another user";
+    }
+  } else if (!S_ISCHR(st.st_mode)) {
+    *why = S_ISBLK(st.st_mode) ? "it is a block device" : "it is not a file";
+  }
+  if (*why) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+// Take fd as the log. A regular file is kept with its parent and name
+static int use_log_fd(int fd, int parent_fd, const char *leaf) {
+  struct stat st;
+  FILE *stream = fdopen(fd, "a");
+  if (!stream) {
+    close(fd);
+    return -1;
+  }
+  fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+  log_stream = stream;
+  log_is_pipe = fstat(fd, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode));
+  if (parent_fd >= 0 && S_ISREG(st.st_mode)) {
+    log_parent_fd = parent_fd;
+    snprintf(log_leaf, sizeof(log_leaf), "%s", leaf);
+  } else if (parent_fd >= 0) {
+    close(parent_fd);
+  }
+  return 0;
+}
+
+// Open the log file given with -l, once, for the whole run; see log_begin()
+// for later writes. Its parent is checked like the cache directory's. A
+// symlink there is followed only if root or the user owns it, and its target
+// is resolved and checked the same way, from / down. The file opened must be:
+//   a regular file: the user's, with no other name, not writable by anyone
+//     else (see regular_log_problem()); a missing one is made, mode 0600
+//   a terminal or other character device, such as /dev/null: as it is
+//   a FIFO: root's or the user's, as anyone can make one in a sticky directory
+//   anything reached through /proc/self/fd, as /dev/stdout, /dev/stderr and
+//     /dev/fd/N are: a descriptor sqwatch was given, as it is
+// Block devices and directories are refused. Returns 0, or -1 once it has
+// said why
+int open_log_file(const char *log_file) {
+  char path[PATH_MAX];
+  char next[PATH_MAX];
+  const char *leaf;
+  const char *why = NULL;
+  const char *current = log_file;
+  log_given = log_file;
+
+  for (int hops = 0; hops <= 40; hops++) {
+    int parent_fd = open_trusted_parent("log file", current, 0, path, sizeof(path), &leaf);
+    if (parent_fd < 0) {
+      return -1;
+    }
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISLNK(st.st_mode)) {
+      int fd = open_log_leaf(parent_fd, leaf, &why);
+      if (fd >= 0 && use_log_fd(fd, parent_fd, leaf) == 0) {
+        return 0;
+      }
+      close(parent_fd);
+      return refuse_path("log file", current, NULL, why ? why : strerror(errno));
+    }
+    if (!owned_by_root_or_me(&st)) {
+      close(parent_fd);
+      return refuse_path("log file", current, NULL, "it is a symlink owned by another user");
+    }
+
+    struct statfs sfs;
+    if (fstatfs(parent_fd, &sfs) == 0 && sfs.f_type == PROC_SUPER_MAGIC) {
+      // /proc/self/fd/N: a descriptor of this process; its link is not a path
+      struct stat target;
+      int is_fifo = fstatat(parent_fd, leaf, &target, 0) == 0 && S_ISFIFO(target.st_mode);
+      int fd = open_log_at(parent_fd, leaf, 0, is_fifo);
+      if (fd < 0) {
+        why = errno == EISDIR ? "it is a directory" : strerror(errno);
+      } else if (fstat(fd, &target) != 0) {
+        why = strerror(errno);
+      } else if (S_ISDIR(target.st_mode) || S_ISBLK(target.st_mode)) {
+        why = S_ISDIR(target.st_mode) ? "it is a directory" : "it is a block device";
+      }
+      if (!why && use_log_fd(fd, -1, NULL) == 0) {
+        close(parent_fd);
+        return 0;
+      }
+      if (fd >= 0 && why) {
+        close(fd);
+      }
+      close(parent_fd);
+      return refuse_path("log file", current, NULL, why ? why : strerror(errno));
+    }
+
+    // Go on from the target, beside the link if it is relative
+    char target[PATH_MAX];
+    char dir[PATH_MAX];
+    char proc_path[32];
+    ssize_t n = readlinkat(parent_fd, leaf, target, sizeof(target) - 1);
+    snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", parent_fd);
+    ssize_t d = target[0] == '/' ? 0 : readlink(proc_path, dir, sizeof(dir) - 1);
+    close(parent_fd);
+    if (n < 0 || d < 0) {
+      return refuse_path("log file", current, NULL, strerror(errno));
+    }
+    target[n] = '\0';
+    dir[d] = '\0';
+    if (snprintf(next, sizeof(next), "%s%s%s", dir, d ? "/" : "", target) >= (int)sizeof(next)) {
+      return refuse_path("log file", current, NULL, strerror(ENAMETOOLONG));
+    }
+    current = next;
+  }
+  return refuse_path("log file", log_file, NULL, strerror(ELOOP));
+}
+
+// The log stream to write an entry to, or NULL if there is none. A regular
+// file that was renamed, removed or replaced since it was opened (rotated) is
+// opened again beneath its parent with the same checks; if the new one cannot
+// be used, logging stops. SIGPIPE is held until log_end() for a pipe, so that
+// a reader that went away does not end sqwatch
+FILE *log_begin(void) {
+  if (!log_stream) {
+    return NULL;
+  }
+  if (log_parent_fd >= 0) {
+    struct stat named, opened;
+    if (fstatat(log_parent_fd, log_leaf, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        fstat(fileno(log_stream), &opened) != 0 ||
+        named.st_dev != opened.st_dev || named.st_ino != opened.st_ino) {
+      const char *why = NULL;
+      int fd = open_log_leaf(log_parent_fd, log_leaf, &why);
+      struct stat st;
+      if (fd >= 0 && (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))) {
+        close(fd);
+        fd = -1;
+        why = "it is not a regular file any more";
+      }
+      FILE *stream = fd < 0 ? NULL : fdopen(fd, "a");
+      fclose(log_stream);
+      log_stream = stream;
+      if (!stream) {
+        if (fd >= 0) {
+          close(fd);
+        }
+        refuse_path("log file", log_given, NULL, why ? why : strerror(errno));
+        fprintf(stderr, RED "+ Logging stopped\n" RESET);
+        close(log_parent_fd);
+        log_parent_fd = -1;
+        return NULL;
+      }
+      fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+    }
+  }
+  if (log_is_pipe) {
+    sigset_t pipe_set;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    sigprocmask(SIG_BLOCK, &pipe_set, &log_prev_mask);
+  }
+  return log_stream;
+}
+
+// Finish an entry begun with log_begin()
+void log_end(void) {
+  if (!log_stream) {
+    return;
+  }
+  int failed = fflush(log_stream) != 0;
+  if (log_is_pipe) {
+    sigset_t pipe_set;
+    struct timespec now = {0, 0};
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    while (sigtimedwait(&pipe_set, NULL, &now) > 0) {
+    }
+    sigprocmask(SIG_SETMASK, &log_prev_mask, NULL);
+    if (failed && !log_broken) {
+      char shown[PATH_MAX];
+      fprintf(stderr, RED "+ Log %s: %s; entries are lost until it has a reader again\n" RESET,
+              printable(log_given, shown, sizeof(shown)), strerror(errno));
+    }
+    log_broken = failed;
+    clearerr(log_stream);
+  }
 }
 
 // Remove the cache directory this run made: its contents beneath the

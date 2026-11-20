@@ -258,14 +258,9 @@ void print_diff(file_lines *current, file_lines *cached, int verbose) {
 // Modified log_changes to include the diff output
 void log_changes(const char *log_file, const char *path, const char *event_type,
                  file_lines *current, file_lines *cached) {
-  if (!log_file)
+  FILE *log_fp = log_file ? log_begin() : NULL;
+  if (!log_fp)
     return;
-
-  FILE *log_fp = fopen(log_file, "a");
-  if (!log_fp) {
-    perror(RED "Failed to open log file" RESET);
-    return;
-  }
 
   time_t now = time(NULL);
   char *timestamp = ctime(&now);
@@ -354,7 +349,7 @@ void log_changes(const char *log_file, const char *path, const char *event_type,
   }
 
   fprintf(log_fp, "=== End Text Diff ===\n\n");
-  fclose(log_fp);
+  log_end();
 }
 
 int is_binary_file(const char *filename, const char *io_path) {
@@ -587,15 +582,9 @@ void print_bin_diff(const char *path, const char *io_path,
 
 void log_bin_diff(const char *log_file, const char *path,
                   const struct diff_entry *diffs, size_t diff_count) {
-  if (!log_file)
+  FILE *log_fp = log_file ? log_begin() : NULL;
+  if (!log_fp)
     return;
-
-  FILE *log_fp = fopen(log_file, "a");
-  if (!log_fp) {
-    fprintf(stderr, RED "Failed to open log file for binary diff: %s\n" RESET,
-            strerror(errno));
-    return;
-  }
 
   time_t now = time(NULL);
   char *timestamp = ctime(&now);
@@ -625,5 +614,5 @@ void log_bin_diff(const char *log_file, const char *path,
   }
 
   fprintf(log_fp, "=== End Binary Diff ===\n\n");
-  fclose(log_fp);
+  log_end();
 }

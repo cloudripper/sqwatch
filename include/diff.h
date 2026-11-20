@@ -2,6 +2,7 @@
 #define DIFF_H
 
 #include <stddef.h>
+#include <stdio.h>
 
 // Colors for output formatting
 #define RED "\033[31m"

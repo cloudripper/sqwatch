@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -259,8 +260,14 @@ int main(int argc, char *argv[]) {
     exit(EXIT_FAILURE);
   }
 
-  if (log_file) {
-    printf(DARK_GREY "+ Logging to %s\n" RESET, log_file);
+  // The log is only written by diffs. It is opened here, once; a log that
+  // cannot be used safely ends the run
+  if (log_file && config.diff_enabled) {
+    if (open_log_file(log_file) != 0) {
+      exit(EXIT_FAILURE);
+    }
+    char shown[PATH_MAX];
+    printf(DARK_GREY "+ Logging to %s\n" RESET, printable(log_file, shown, sizeof(shown)));
   }
 
   config.debounce_t = debounce_t;
