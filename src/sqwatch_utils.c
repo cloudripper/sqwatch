@@ -77,7 +77,7 @@ void print_event_type(struct inotify_event *event) {
 
 // Copy a path for display, replacing control characters so a file name
 // cannot inject terminal escapes or extra lines into the output
-static const char *printable(const char *path, char *buf, size_t size) {
+const char *printable(const char *path, char *buf, size_t size) {
     size_t i = 0;
     for (; path[i] != '\0' && i + 1 < size; i++) {
         unsigned char c = (unsigned char)path[i];
@@ -649,7 +649,7 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                         if (config.verbose) {
                             printf(DARK_GREY "+ Removing cache for: %s\n" RESET, config.cached_paths[event->wd]);
                         }
-                        unlink(config.cached_paths[event->wd]); // Remove cache file
+                        unlink_cache_file(config.cached_paths[event->wd]); // Remove cache file
                         free(config.cached_paths[event->wd]);
                         config.cached_paths[event->wd] = NULL;
                     }
@@ -686,7 +686,7 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                             config.watch_paths[event_wd] = NULL;
                             if (config.cached_paths[new_wd] && (!config.cached_paths[event_wd] ||
                                 strcmp(config.cached_paths[new_wd], config.cached_paths[event_wd]) != 0)) {
-                                unlink(config.cached_paths[new_wd]);
+                                unlink_cache_file(config.cached_paths[new_wd]);
                             }
                             free(config.cached_paths[new_wd]);
                             config.cached_paths[new_wd] = config.cached_paths[event_wd];

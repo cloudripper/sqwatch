@@ -1,4 +1,6 @@
+#define _GNU_SOURCE  // O_PATH
 #include "cache.h"
+#include "sqwatch.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -10,19 +12,61 @@
 
 int cache_dir_owned = 0;
 
-// Open a file in the cache directory, which others may be able to write to:
-// a symlink planted under the name is not followed, and O_NONBLOCK keeps a
-// FIFO from blocking the open. Anything but a regular file is refused
+// The cache directory as create_caches() checked it. Cache files are reached
+// beneath this descriptor, never through the cache path again, so a directory
+// put in its place later is not used
+int cache_dir_fd = -1;
+
+// A cache file is shown as <cache_dir>/<name>; this is its name
+static const char *cache_name(const char *path) {
+  const char *slash = strrchr(path, '/');
+  return slash ? slash + 1 : path;
+}
+
+// Open a file in the cache directory: a symlink planted under the name is not
+// followed, and O_NONBLOCK keeps a FIFO from blocking the open. Anything but a
+// regular file is refused. A cache file holds a copy of a watched file, so one
+// opened for writing is made readable by its owner only. O_TRUNC is applied
+// only once the file has passed those checks. A file the user does not own, or
+// one with another name (a hard link), is not read or written; a write first
+// replaces it, and one the user may not write, with a new file of the user's
 int open_cache_file(const char *path, int flags) {
-  int fd = open(path, flags | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0644);
+  const char *name = cache_name(path);
+  int writing = (flags & O_ACCMODE) != O_RDONLY;
+  struct stat st;
+  if (writing && fstatat(cache_dir_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+      S_ISREG(st.st_mode) &&
+      (st.st_uid != geteuid() || st.st_nlink != 1 || !(st.st_mode & S_IWUSR))) {
+    if (unlinkat(cache_dir_fd, name, 0) != 0) {
+      return -1;
+    }
+    flags |= O_CREAT | O_EXCL;
+  }
+  int fd = openat(cache_dir_fd, name, (flags & ~O_TRUNC) | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
+                  0600);
   if (fd < 0) {
     return -1;
   }
 
-  struct stat st;
-  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
-    close(fd);
+  int ok = fstat(fd, &st) == 0;
+  if (ok && !S_ISREG(st.st_mode)) {
     errno = EINVAL;
+    ok = 0;
+  }
+  if (ok && (st.st_uid != geteuid() || st.st_nlink != 1)) {
+    errno = EPERM;
+    ok = 0;
+  }
+  if (ok && writing) {
+    ok = fchmod(fd, 0600) == 0;
+  }
+  if (ok && (flags & O_TRUNC)) {
+    ok = ftruncate(fd, 0) == 0;
+  }
+  if (!ok) {
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
     return -1;
   }
   fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
@@ -33,7 +77,8 @@ int copy_file(const char *src, const char *dest) {
   struct stat statbuf;
 
   // Check if the destination is a directory
-  if (lstat(dest, &statbuf) == 0 && S_ISDIR(statbuf.st_mode)) {
+  if (fstatat(cache_dir_fd, cache_name(dest), &statbuf, AT_SYMLINK_NOFOLLOW) == 0 &&
+      S_ISDIR(statbuf.st_mode)) {
     fprintf(stderr, "Failed to open destination file: %s is a directory\n",
             dest);
     return -1;
@@ -101,27 +146,53 @@ void remove_directory(const char *path) {
   }
 }
 
+int unlink_cache_file(const char *path) {
+  return unlinkat(cache_dir_fd, cache_name(path), 0);
+}
+
 // Set up the cache directory. Returns 0 if it can be used, -1 otherwise. The
-// watched files are copied in by cache_watched_files()
+// cache holds copies of the watched files, so a directory that is not the
+// user's own, or that others can write to, is refused. It is checked through
+// the descriptor every later cache access goes through. The watched files are
+// copied in by cache_watched_files()
 int create_caches(const char *cache_dir) {
   if (!cache_dir) {
     return -1;
   }
 
-  if (mkdir(cache_dir, 0700) == 0) {
-    cache_dir_owned = 1;
-  } else if (errno == EEXIST) {
-    struct stat st;
-    if (lstat(cache_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        fprintf(stderr, RED "Cache path %s exists and is not a directory\n" RESET, cache_dir);
-        return -1;
-    }
-    fprintf(stderr, DARK_GREY "+ Cache directory %s already exists; it will not be removed on exit\n" RESET, cache_dir);
-  } else {
+  int created = mkdir(cache_dir, 0700) == 0;
+  if (!created && errno != EEXIST) {
     perror("Failed to create cache directory");
     return -1;
   }
 
+  struct stat st;
+  const char *reason = NULL;
+  int fd = open(cache_dir, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0 || fstat(fd, &st) != 0) {
+    reason = errno == ENOTDIR ? "it is not a directory" : strerror(errno);
+  } else if (st.st_uid != geteuid()) {
+    reason = "it is owned by another user";
+  } else if (st.st_mode & (S_IWGRP | S_IWOTH)) {
+    reason = "other users can write to it";
+  }
+
+  char shown[PATH_MAX];
+  if (reason) {
+    fprintf(stderr, RED "+ Not using cache directory %s: %s\n" RESET,
+            printable(cache_dir, shown, sizeof(shown)), reason);
+    if (fd >= 0) {
+      close(fd);
+    }
+    return -1;
+  }
+
+  cache_dir_fd = fd;
+  cache_dir_owned = created;
+  if (!created) {
+    fprintf(stderr, DARK_GREY "+ Cache directory %s already exists; it will not be removed on exit\n" RESET,
+            printable(cache_dir, shown, sizeof(shown)));
+  }
   return 0;
 }
 
@@ -147,7 +218,7 @@ void create_cache_for_file(const char *path, const char *io_path, const char *ca
 
     // Only copy the file if it doesn't exist in cache
     struct stat cache_stat;
-    if (lstat(cache_path, &cache_stat) != 0) {
+    if (fstatat(cache_dir_fd, base, &cache_stat, AT_SYMLINK_NOFOLLOW) != 0) {
         if (copy_file(io_path, cache_path) == 0) {
             if (verbose) {
                 printf(DARK_GREY "+ Cached: %s -> %s\n" RESET, path, cache_path);

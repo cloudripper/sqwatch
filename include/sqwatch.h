@@ -64,6 +64,7 @@ void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags, sqw
 void cache_watched_files(sqwatch_config *config);
 void handle_events(int inotify_fd, sqwatch_config config);
 void print_usage(void);
+const char *printable(const char *path, char *buf, size_t size);
 
 
 #endif // SQWATCH_H

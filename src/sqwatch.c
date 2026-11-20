@@ -30,7 +30,12 @@ static void cleanup(int signo) {
   // Wipe the cache directory if it exists
   if (cache_dir && cache_dir_owned) {
     printf(RED "+ Wiping cache directory: %s\n" RESET, cache_dir);
-    remove_directory(cache_dir);
+    // Empty the directory that was created and checked, not whatever the
+    // path names now; then remove the name if it is an empty directory
+    char io_path[32];
+    snprintf(io_path, sizeof(io_path), "/proc/self/fd/%d", cache_dir_fd);
+    remove_directory(io_path);
+    rmdir(cache_dir);
   }
 
   free(cache_dir);
