@@ -411,7 +411,6 @@ void run_diff(const char *path, const char *io_path, const char *cache_dir,
       fprintf(stderr, RED "Failed to update cache file: %s\n" RESET,
               cached_file_path);
     }
-    return;
   }
 
   // Both files have content, proceed with normal diff
