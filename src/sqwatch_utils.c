@@ -635,6 +635,11 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                     if (config.verbose) {
                         printf(DARK_GREY "+ File no longer exists: %s\n" RESET, full_path);
                     }
+                    // Release the kernel watch too, or it stays for as long as
+                    // the file lives elsewhere. After IN_IGNORED it is gone
+                    if (!(event->mask & IN_IGNORED)) {
+                        inotify_rm_watch(inotify_fd, event->wd);
+                    }
                     // Clean up watch path
                     free(config.watch_paths[event->wd]);
                     config.watch_paths[event->wd] = NULL;
@@ -674,6 +679,16 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                         }
                         config.watch_roots[new_wd] = config.watch_roots[event_wd];
                         if (event_wd != new_wd) {
+                            // The old watch is gone. new_wd may already have
+                            // watched this file under another name (a temporary
+                            // file renamed over it): drop that name's cache
+                            free(config.watch_paths[event_wd]);
+                            config.watch_paths[event_wd] = NULL;
+                            if (config.cached_paths[new_wd] && (!config.cached_paths[event_wd] ||
+                                strcmp(config.cached_paths[new_wd], config.cached_paths[event_wd]) != 0)) {
+                                unlink(config.cached_paths[new_wd]);
+                            }
+                            free(config.cached_paths[new_wd]);
                             config.cached_paths[new_wd] = config.cached_paths[event_wd];
                             config.cached_paths[event_wd] = NULL;
                         }
