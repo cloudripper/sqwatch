@@ -797,6 +797,14 @@ static int log_is_pipe;                  // FIFO or pipe: SIGPIPE held
 static int log_broken;                   // the reader of the pipe went away
 static sigset_t log_prev_mask;
 
+// Whether fd is the cache directory (with every run's directory in it).
+// sqwatch does not watch it when it is in a watched tree
+int is_cache_dir(int fd) {
+  struct stat cache_st, st;
+  return cache_top_fd >= 0 && fstat(cache_top_fd, &cache_st) == 0 && fstat(fd, &st) == 0 &&
+         cache_st.st_dev == st.st_dev && cache_st.st_ino == st.st_ino;
+}
+
 // Whether fd is the log file. sqwatch does not watch its own log when it is in
 // a watched tree: each diff written to it would be a change to diff in turn
 int is_log_file(int fd) {

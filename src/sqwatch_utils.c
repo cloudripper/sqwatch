@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fnmatch.h>
 #include <utime.h>
 #include <libgen.h>
 #include <sys/stat.h>
@@ -720,12 +721,42 @@ static watch_entry *attach_name(int inotify_fd, sqwatch_config *config, int wd, 
   return entry;
 }
 
+// Whether the entry whose displayed path is path, in root, is ignored: it
+// matches a -i pattern, or it is named .git. A pattern with a '/' is matched
+// against the path relative to the root, '/' only matched by '/'; any other
+// against the last component. What -d or -f names is never ignored
+static int is_ignored(const sqwatch_config *config, int root, const char *path) {
+    const char *rel = rel_path(&config->roots[root], path);
+    if (*rel == '\0' || config->roots[root].rel) {
+        return 0;  // A -d directory or a -f file itself
+    }
+    const char *base = strrchr(rel, '/');
+    base = base ? base + 1 : rel;
+    if (strcmp(base, ".git") == 0) {
+        return 1;
+    }
+    for (int i = 0; i < config->ignore_count; i++) {
+        const char *pattern = config->ignores[i];
+        if (strchr(pattern, '/') ? fnmatch(pattern, rel, FNM_PATHNAME) == 0 :
+                                   fnmatch(pattern, base, 0) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // Watch the regular file `name` in the directory parent_fd; path is its
 // displayed path. A file found after startup (at_runtime) is cached here, if
 // it has no cache entry yet; at_runtime 2 is a file that was just created or
 // moved into the tree
 static void watch_file(int inotify_fd, int parent_fd, const char *name, const char *path,
                        int root, uint32_t flags, sqwatch_config *config, int at_runtime) {
+    if (is_ignored(config, root, path)) {
+        if (config->verbose) {
+            printf(DARK_GREY "+ Ignoring %s\n" RESET, shown_name(path));
+        }
+        return;
+    }
     int fd = open_file_at(parent_fd, name);
     if (fd != -1 && is_log_file(fd)) {
         if (config->verbose) {
@@ -882,6 +913,14 @@ static int enter_dir(int inotify_fd, int fd, char *path, int root, uint32_t flag
                      sqwatch_config *config, int at_runtime, walk_level **levels,
                      size_t *depth, size_t *size) {
     struct stat st;
+    // An ignored directory, or sqwatch's own cache, is neither watched nor
+    // walked
+    if (is_ignored(config, root, path) || is_cache_dir(fd)) {
+        if (config->verbose) {
+            printf(DARK_GREY "+ Ignoring %s\n" RESET, shown_name(path));
+        }
+        return 0;
+    }
     if (fstat(fd, &st) != 0) {
         fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, shown_name(path),
                 strerror(errno));
@@ -1549,6 +1588,22 @@ static void on_file_event(event_loop *loop, int wd, uint32_t mask) {
     }
 }
 
+// Whether name in the directory dir_path (in root) is sqwatch's own log file
+// or cache directory
+static int is_own_file(sqwatch_config *config, int root, const char *dir_path, const char *name) {
+    const watch_root *top = &config->roots[root];
+    int dir_fd = open_beneath(top->fd, rel_path(top, dir_path), O_PATH | O_DIRECTORY);
+    int fd = dir_fd == -1 ? -1 : openat(dir_fd, name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    int own = fd != -1 && (is_log_file(fd) || is_cache_dir(fd));
+    if (fd != -1) {
+        close(fd);
+    }
+    if (dir_fd != -1) {
+        close(dir_fd);
+    }
+    return own;
+}
+
 // An event on the watch of a directory: an entry was created, removed or moved
 // in or out of it. What comes in is watched (and cached, see watch_file());
 // what goes is dropped. The directory itself gone (IN_IGNORED) takes what is
@@ -1572,6 +1627,12 @@ static void on_dir_event(event_loop *loop, int wd, const struct inotify_event *e
     }
     if (snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, event->name) >= (int)sizeof(full_path)) {
         fprintf(stderr, RED "+ Path too long, skipping event\n" RESET);
+        return;
+    }
+
+    // Nothing about an ignored entry is shown, and it is never watched
+    if (is_ignored(config, dir_root, full_path) || is_own_file(config, dir_root, dir_path,
+                                                                 event->name)) {
         return;
     }
 
@@ -1807,6 +1868,11 @@ void print_usage(void) {
            "                   move     a file or directory was moved or renamed\n"
            "                   attrib   mode, owner or times changed\n"
            "                   all      all of the above\n"
+           "  -i PATTERN     Ignore what matches PATTERN (repeatable): not watched, not\n"
+           "                 walked, never shown. A PATTERN with a '/' is matched against\n"
+           "                 the path below the watched directory, any other against the\n"
+           "                 name; for example -i '*.o' -i build/tmp. Always ignored: .git,\n"
+           "                 and sqwatch's own log file and cache directory\n"
            "\n"
            "Command:\n"
            "  -c COMMAND     Run COMMAND with /bin/sh -c on each change; a run still going\n"

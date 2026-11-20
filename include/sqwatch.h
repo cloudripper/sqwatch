@@ -96,6 +96,8 @@ typedef struct {
     int *pending;            // Files with events deferred by the debounce
     size_t pending_count;
     size_t pending_size;
+    char **ignores;          // -i patterns
+    int ignore_count;
     watch_root *roots;       // One per -d or -f
     int root_count;
     long long debounce_ms;   // The debounce time

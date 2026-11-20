@@ -73,6 +73,7 @@ Watch:
   - `move`: a file or directory was moved or renamed
   - `attrib`: mode, owner or times changed
   - `all`: all of the above
+- `-i PATTERN`: Ignore what matches PATTERN (repeatable). An ignored directory is not watched and not walked; an ignored file never triggers the command, is never diffed and never cached. PATTERN is a shell pattern (see `fnmatch(3)`). A PATTERN with a `/` is matched against the path below the watched directory (`/` is only matched by `/`), any other against the name alone; a trailing `/` is dropped. For example `-i '*.o' -i build/tmp`. Always ignored: `.git`, and sqwatch's own log file and cache directory when they are inside a watched tree. Ignores apply at startup, to entries created or moved in later, and when the tree is walked again after lost events
 
 Command:
 - `-c COMMAND`: Run COMMAND with `/bin/sh -c` on each change; a run still going is stopped and started again

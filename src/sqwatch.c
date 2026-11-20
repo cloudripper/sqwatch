@@ -111,6 +111,8 @@ static const char *option_help(int opt) {
   case 'q': return "-q EVENTS: one or more of modify, create, delete, move, attrib, all,\n"
                    "  separated by commas, for example -q modify,create";
   case 'l': return "-l FILE: the log file for diffs (with --diff)";
+  case 'i': return "-i PATTERN: a shell pattern (see fnmatch(3)); with a '/' it is matched\n"
+                   "  against the path below the watched directory, else against the name";
   default: return NULL;
   }
 }
@@ -309,7 +311,7 @@ int main(int argc, char *argv[]) {
   // Errors are reported here, not by getopt: a leading ':' tells a missing
   // argument from an unknown option
   opterr = 0;
-  while ((opt = getopt_long(argc, argv, ":d:f:t:q:c:l:vh", long_options, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, ":d:f:t:q:c:l:i:vh", long_options, NULL)) != -1) {
     struct stat statbuf;
     switch (opt) {
     case 'd':
@@ -348,6 +350,23 @@ int main(int argc, char *argv[]) {
         bad_value('q', optarg, problem);
       }
       flags |= asked;
+      break;
+    }
+    case 'i': {
+      // A trailing '/' says nothing more: directories are matched anyway
+      size_t len = strlen(optarg);
+      while (len > 1 && optarg[len - 1] == '/') {
+        optarg[--len] = '\0';
+      }
+      if (len == 0 || strcmp(optarg, "/") == 0) {
+        bad_value('i', optarg, "the pattern is empty");
+      }
+      config.ignores = config.ignores ? config.ignores : calloc(argc, sizeof(*config.ignores));
+      if (!config.ignores) {
+        perror("calloc");
+        exit(EXIT_FAILURE);
+      }
+      config.ignores[config.ignore_count++] = optarg;
       break;
     }
     case 'l':
@@ -457,18 +476,20 @@ int main(int argc, char *argv[]) {
   }
   close(proc_fd);
 
+  // The cache is set up before the walk, so that the walk knows it, and
+  // leaves it out if it is in a watched tree
+  if (cache_dir && config.diff_enabled && create_caches(cache_dir) != 0) {
+    // Diffs would read and write files under that path: do not diff at all
+    config.diff_enabled = 0;
+    fprintf(stderr, RED "+ Diff disabled: cache directory %s cannot be used\n" RESET, shown_name(cache_dir));
+  }
+
   for (int i = 0; i < path_count; i++) {
     add_watches_recursive(inotify_fd, paths[i], flags, &config);
   }
 
   if (cache_dir && config.diff_enabled) {
-    if (create_caches(cache_dir) == 0) {
-      cache_watched_files(&config);
-    } else {
-      // Diffs would read and write files under that path: do not diff at all
-      config.diff_enabled = 0;
-      fprintf(stderr, RED "+ Diff disabled: cache directory %s cannot be used\n" RESET, shown_name(cache_dir));
-    }
+    cache_watched_files(&config);
   }
 
   cleanup(handle_events(inotify_fd, signal_fd, &config));
