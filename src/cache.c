@@ -562,13 +562,56 @@ static int refuse_path(const char *what, const char *path, const char *where, co
   return -1;
 }
 
+// Make the directory parent, an absolute path, mode 0700, if it does not
+// exist and the directory it is in passes open_trusted_dir(): ~/.cache on an
+// account that has none yet. Returns 1 if it made it
+static int make_missing_parent(const char *parent) {
+  char above[PATH_MAX];
+  char where[PATH_MAX];
+  const char *reason = NULL;
+  snprintf(above, sizeof(above), "%s", parent);
+  size_t len = strlen(above);
+  while (len > 1 && above[len - 1] == '/') {
+    above[--len] = '\0';
+  }
+  char *slash = strrchr(above, '/');
+  if (!slash) {
+    return 0;
+  }
+  const char *name = slash + 1;
+  if (*name == '\0' || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+    return 0;
+  }
+  char leaf[NAME_MAX + 1];
+  if (snprintf(leaf, sizeof(leaf), "%s", name) >= (int)sizeof(leaf)) {
+    return 0;
+  }
+  slash[slash == above ? 1 : 0] = '\0';
+  int fd = open_trusted_dir(above, where, sizeof(where), &reason);
+  if (fd < 0) {
+    return 0;
+  }
+  struct stat st;
+  int made = fstatat(fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
+             mkdirat(fd, leaf, 0700) == 0;
+  close(fd);
+  if (made) {
+    while (parent[0] == '/' && parent[1] == '/') {
+      parent++;
+    }
+    fprintf(stderr, DARK_GREY "+ Created %s for the cache\n" RESET, shown_name(parent));
+  }
+  return made;
+}
+
 // Open the directory that is to hold the last component of path with
 // open_trusted_dir(), and point *leaf at that component, copied into buf. The
 // last component has to be a name in the parent: a trailing "/" or "/." would
 // make the kernel follow a symlink there. A trailing "/" is dropped from a
 // directory's path and refused in a file's (is_dir 0). A relative path is
-// checked from / down too. Returns the parent's descriptor, or -1 once it has
-// said why
+// checked from / down too. A directory's parent that does not exist is made
+// if it can be (see make_missing_parent()). Returns the parent's descriptor,
+// or -1 once it has said why
 static int open_trusted_parent(const char *what, const char *path, int is_dir, char *buf,
                                size_t size, const char **leaf) {
   int len = snprintf(buf, size, "%s", path);
@@ -608,6 +651,9 @@ static int open_trusted_parent(const char *what, const char *path, int is_dir, c
   char where[PATH_MAX];
   const char *reason = NULL;
   int parent_fd = open_trusted_dir(parent, where, sizeof(where), &reason);
+  if (parent_fd < 0 && is_dir && make_missing_parent(parent)) {
+    parent_fd = open_trusted_dir(parent, where, sizeof(where), &reason);
+  }
   if (parent_fd < 0) {
     return refuse_path(what, path, where, reason);
   }
@@ -622,10 +668,28 @@ static int open_trusted_parent(const char *what, const char *path, int is_dir, c
 // directory of its own, which every later cache access goes through and which
 // is removed on exit (see remove_caches()). The watched files are copied in by
 // cache_watched_files()
+static int open_caches(const char *cache_dir, int *again);
+
 int create_caches(const char *cache_dir) {
   if (!cache_dir) {
     return -1;
   }
+  // Another run that made the cache directory may remove it, empty, just
+  // after this one found it: it is made again then
+  int again = 0;
+  for (int tries = 0; tries < 4; tries++) {
+    int result = open_caches(cache_dir, &again);
+    if (!again) {
+      return result;
+    }
+    again = 0;
+  }
+  return refuse_path("cache directory", cache_dir, NULL, "it keeps being removed");
+}
+
+// create_caches() once; *again is set if the cache directory was removed
+// while this run was setting up in it
+static int open_caches(const char *cache_dir, int *again) {
 
   char path[PATH_MAX];
   const char *leaf;
@@ -677,6 +741,12 @@ int create_caches(const char *cache_dir) {
     snprintf(run_name, sizeof(run_name), "run.%02x%02x%02x%02x%02x%02x%02x%02x", random[0],
              random[1], random[2], random[3], random[4], random[5], random[6], random[7]);
     if (mkdirat(fd, run_name, 0700) != 0) {
+      if (errno == ENOENT) {
+        *again = 1;
+        close(fd);
+        close(parent_fd);
+        return -1;
+      }
       if (errno != EEXIST) {
         reason = strerror(errno);
         break;

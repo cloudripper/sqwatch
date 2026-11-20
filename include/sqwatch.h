@@ -121,6 +121,7 @@ void print_usage(void);
 watch_entry *watch_find(watch_table *table, int wd);
 watch_entry *watch_add(watch_table *table, int wd);
 void stop_if_signalled(void);
+void stop_if_output_closed(void);
 const char *printable(const char *path, char *buf, size_t size);
 const char *shown_name(const char *name);
 const char *shown_text(const char *text);

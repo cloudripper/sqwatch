@@ -24,9 +24,10 @@ sqwatch_config config;
 // SIGINT and SIGTERM are read from here; see main()
 static int signal_fd = -1;
 
-// Runs once SIGINT or SIGTERM has been read from signal_fd, outside any signal
-// handler. The cache goes first, as the command may take its time to exit or
-// ignore signo; another signal, or 5 s, and it is killed
+// Runs once SIGINT, SIGTERM or SIGHUP has been read from signal_fd, outside
+// any signal handler, or once stdout is found closed (see
+// stop_if_output_closed()). The cache goes first, as the command may take its
+// time to exit or ignore signo; another signal, or 5 s, and it is killed
 static void cleanup(int signo) {
   printf(RED "\n+ Exiting SQWatch... \n" RESET);
 
@@ -67,25 +68,50 @@ static void cleanup(int signo) {
   exit(EXIT_SUCCESS);
 }
 
-// Leave through cleanup() if SIGINT or SIGTERM is waiting. Long work outside
-// the event loop calls this, so that a signal does not wait for it to finish
+// Whether what reads stdout went away (a pipe into `head`, say): a write
+// there failed with EPIPE, as SIGPIPE is ignored, or the pipe reports an
+// error. revents is what poll() returned for stdout, if the caller polled it
+static int output_closed(short revents) {
+  return (revents & (POLLERR | POLLHUP)) || (fflush(stdout) == EOF && errno == EPIPE);
+}
+
+// Leave through cleanup() if stdout is closed, so that sqwatch is not left
+// to be killed by a write with the cache behind
+void stop_if_output_closed(void) {
+  struct pollfd out = {STDOUT_FILENO, 0, 0};
+  if (output_closed(poll(&out, 1, 0) > 0 ? out.revents : 0)) {
+    cleanup(SIGTERM);
+  }
+}
+
+// Leave through cleanup() if SIGINT, SIGTERM or SIGHUP is waiting, or stdout
+// is closed. Long work outside the event loop calls this, so that a signal
+// does not wait for it to finish
 void stop_if_signalled(void) {
-  struct pollfd pending = {signal_fd, POLLIN, 0};
+  struct pollfd pending[2] = {{signal_fd, POLLIN, 0}, {STDOUT_FILENO, 0, 0}};
   struct signalfd_siginfo info;
-  if (signal_fd >= 0 && poll(&pending, 1, 0) > 0 &&
-      read(signal_fd, &info, sizeof(info)) == (ssize_t)sizeof(info)) {
-    cleanup((int)info.ssi_signo);
+  if (signal_fd >= 0 && poll(pending, 2, 0) > 0) {
+    if ((pending[0].revents & POLLIN) &&
+        read(signal_fd, &info, sizeof(info)) == (ssize_t)sizeof(info)) {
+      cleanup((int)info.ssi_signo);
+    }
+    if (output_closed(pending[1].revents)) {
+      cleanup(SIGTERM);
+    }
   }
 }
 
 int main(int argc, char *argv[]) {
-  // SIGINT and SIGTERM stay blocked and are read from a signalfd by
-  // handle_events(), so the cache is removed here, and a second signal cannot
-  // interrupt that
+  // SIGINT, SIGTERM and SIGHUP (the terminal closed) stay blocked and are
+  // read from a signalfd by handle_events(), so the cache is removed here,
+  // and a second signal cannot interrupt that. SIGPIPE is ignored: a closed
+  // stdout is seen as EPIPE, and sqwatch leaves through cleanup() then too
   sigset_t stop_signals;
   sigemptyset(&stop_signals);
   sigaddset(&stop_signals, SIGINT);
   sigaddset(&stop_signals, SIGTERM);
+  sigaddset(&stop_signals, SIGHUP);
+  signal(SIGPIPE, SIG_IGN);
   sigprocmask(SIG_BLOCK, &stop_signals, NULL);
   signal_fd = signalfd(-1, &stop_signals, SFD_CLOEXEC);
   if (signal_fd == -1) {

@@ -1232,24 +1232,32 @@ static void stop_command(void) {
 // Run the user's command in its own process group without waiting for it
 static void start_command(const char *command) {
     if (command != NULL) {
-        // Hold SIGTERM/SIGINT across fork. sqwatch keeps them blocked and
-        // reads them from a signalfd; the child must get them as usual
+        // Hold SIGTERM/SIGINT/SIGHUP across fork. sqwatch keeps them blocked
+        // and reads them from a signalfd; the child must get them as usual,
+        // and SIGPIPE too, which sqwatch ignores
         sigset_t block, prev;
         sigemptyset(&block);
         sigaddset(&block, SIGTERM);
         sigaddset(&block, SIGINT);
+        sigaddset(&block, SIGHUP);
         sigprocmask(SIG_BLOCK, &block, &prev);
 
         g_last_pid = fork();
         if (g_last_pid == -1) {
-            perror("fork");
-            exit(EXIT_FAILURE);
+            // Out of processes for now: this run is skipped, the watch goes on
+            fprintf(stderr, RED "+ Could not start the command: %s; it runs again on the next change\n" RESET,
+                    strerror(errno));
+            g_last_pid = 0;
+            sigprocmask(SIG_SETMASK, &prev, NULL);
+            return;
         }
 
         if (g_last_pid == 0) {
             // Child process
             signal(SIGTERM, SIG_DFL);
             signal(SIGINT, SIG_DFL);
+            signal(SIGHUP, SIG_DFL);
+            signal(SIGPIPE, SIG_DFL);
             sigprocmask(SIG_UNBLOCK, &block, NULL);
             setpgid(0, 0);  // Create new process group
             setvbuf(stdout, NULL, _IONBF, 0);
@@ -1715,27 +1723,33 @@ static void diff_changed(event_loop *loop) {
     config->changed_count = 0;
 }
 
-// Handle inotify events until SIGINT or SIGTERM is read from signal_fd, and
-// return that signal
+// Handle inotify events until SIGINT, SIGTERM or SIGHUP is read from
+// signal_fd, and return that signal; SIGTERM if the events cannot be read
 int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
     char buffer[BUF_LEN];
     event_loop loop = {inotify_fd, config, 0, (long long)config->debounce_t * 1000, 0, 0, 0};
 
     while (1) {
-        struct pollfd fds[2] = {{inotify_fd, POLLIN, 0}, {signal_fd, POLLIN, 0}};
+        // stdout is polled for an error only: its reader went away
+        struct pollfd fds[3] = {{inotify_fd, POLLIN, 0}, {signal_fd, POLLIN, 0},
+                                {STDOUT_FILENO, 0, 0}};
         int timeout = run_due(&loop);
-        if (poll(fds, 2, timeout) == -1) {
+        stop_if_output_closed();
+        if (poll(fds, 3, timeout) == -1) {
             if (errno == EINTR) {
                 continue;
             }
             perror("poll");
-            exit(EXIT_FAILURE);
+            return SIGTERM;  // Leave through cleanup() all the same
         }
         if (fds[1].revents & POLLIN) {
             struct signalfd_siginfo info;
             if (read(signal_fd, &info, sizeof(info)) == (ssize_t)sizeof(info)) {
                 return (int)info.ssi_signo;
             }
+        }
+        if (fds[2].revents & (POLLERR | POLLHUP)) {
+            stop_if_output_closed();
         }
         if (!(fds[0].revents & POLLIN)) {
             continue;
@@ -1746,7 +1760,7 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
                 continue;
             }
             perror("inotify read");
-            exit(EXIT_FAILURE);
+            return SIGTERM;
         }
 
         size_t i = 0;
@@ -1776,6 +1790,7 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
             diff_changed(&loop);
         }
         flush_command(&loop);
+        stop_if_output_closed();
     }
 }
 
