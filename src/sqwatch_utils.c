@@ -872,7 +872,10 @@ static int is_ignored(const sqwatch_config *config, int root, const char *path) 
 // A name that went away inside the tree, renamed to another watched name, or
 // out of the tree with its history kept for a while: whatever is made under
 // the old name soon after (an editor that moves the file aside to write a new
-// one) takes over that history
+// one) takes over that history. A file moved out keeps its events not yet
+// handled as well: if the same file comes back, under any watched name, it
+// gets its history and those events back, so moving a file out and in again
+// hides nothing
 #define DEPARTED_SLOTS 64
 #define DEPARTED_MS 3000
 typedef struct {
@@ -881,9 +884,16 @@ typedef struct {
     int to_wd;               // Renamed: the file now has this name ...
     char to_name[NAME_MAX + 1];
     char *cached;            // ... else moved out: its cache entry, kept here
+    dev_t dev;               // Moved out: the file, and what was known of it
+    ino_t ino;
+    uint32_t pending;
+    long long last_fire;
+    off_t fired_size;
+    struct timespec fired_ctime;
     long long when;          // ms of CLOCK_MONOTONIC; 0: a free slot
 } departed_name;
 static departed_name departed[DEPARTED_SLOTS];
+static void defer(sqwatch_config *config, file_entry *f, uint32_t mask);
 
 static long long clock_ms(void) {
     struct timespec ts;
@@ -901,9 +911,10 @@ static void departed_clear(departed_name *d) {
 }
 
 // Remember that name left dir; to (when it was renamed within the tree) is
-// where the file went, else cached (moved out) is kept here
+// where the file went, else gone (moved out) is the file that left, whose
+// cache entry, cached, is kept here, unless another name still has it
 static void departed_add(const dir_entry *dir, const char *name, const file_entry *to,
-                         char *cached) {
+                         const file_entry *gone, char *cached) {
     long long now = clock_ms();
     departed_name *slot = &departed[0];
     for (int i = 0; i < DEPARTED_SLOTS; i++) {
@@ -928,6 +939,12 @@ static void departed_add(const dir_entry *dir, const char *name, const file_entr
     slot->to_wd = to ? to->dir->wd : -1;
     strcpy(slot->to_name, to ? to->name : "");
     slot->cached = cached;
+    slot->dev = gone && gone->inode ? gone->inode->dev : 0;
+    slot->ino = gone && gone->inode ? gone->inode->ino : 0;
+    slot->pending = gone ? gone->pending : 0;
+    slot->last_fire = gone ? gone->last_fire : 0;
+    slot->fired_size = gone ? gone->fired_size : 0;
+    slot->fired_ctime = gone ? gone->fired_ctime : (struct timespec){0, 0};
     slot->when = now;
 }
 
@@ -951,9 +968,31 @@ static long long departed_expire(int all) {
 
 // The new file f takes over the history of its name if the name left a
 // moment ago: the cache entry of the file that had it (which gets a fresh
-// copy of its own), or the one kept for it. Returns 1 if it did
+// copy of its own), or the one kept for it. A file that left the tree a
+// moment ago and came back, under whatever name, gets its own history back,
+// and its events not yet handled, which are handled now (CHANGED_RETURNED).
+// Returns 1 if f took over a history
 static int take_departed(sqwatch_config *config, file_entry *f) {
     long long now = clock_ms();
+    for (int i = 0; f->inode && i < DEPARTED_SLOTS; i++) {
+        departed_name *d = &departed[i];
+        if (d->when == 0 || now - d->when > DEPARTED_MS || d->to_wd != -1 ||
+            d->dev != f->inode->dev || d->ino != f->inode->ino || (!d->dev && !d->ino)) {
+            continue;
+        }
+        char *history = d->cached;
+        d->cached = NULL;
+        d->when = 0;
+        give_history(f, history);
+        f->last_fire = d->last_fire;
+        f->fired_size = d->fired_size;
+        f->fired_ctime = d->fired_ctime;
+        if (d->pending) {
+            defer(config, f, d->pending);
+        }
+        mark_changed(config, f, CHANGED_RETURNED);
+        return 1;
+    }
     for (int i = 0; i < DEPARTED_SLOTS; i++) {
         departed_name *d = &departed[i];
         if (d->when == 0 || now - d->when > DEPARTED_MS || d->wd != f->dir->wd ||
@@ -1805,14 +1844,30 @@ static void defer(sqwatch_config *config, file_entry *f, uint32_t mask) {
 // came meanwhile, if the file changed since (see run_due()). A diff is made
 // for a modification; mask IN_IGNORED stands for a file found changed without
 // an event of its own
+static void fire_file_fd(event_loop *loop, file_entry *f, uint32_t mask, int quiet, int force,
+                         int file_fd);
+
 static void fire_file(event_loop *loop, file_entry *f, uint32_t mask, int quiet, int force) {
+    fire_file_fd(loop, f, mask, quiet, force, -1);
+}
+
+// fire_file(), on the file open as file_fd (an O_PATH descriptor, which this
+// closes) if it is not -1, instead of the one f names
+static void fire_file_fd(event_loop *loop, file_entry *f, uint32_t mask, int quiet, int force,
+                         int file_fd) {
     sqwatch_config *config = loop->config;
     if (!force && f->last_fire && loop->now - f->last_fire < loop->window) {
         defer(config, f, mask);
+        if (file_fd != -1) {
+            close(file_fd);
+        }
         return;
     }
     char path[PATH_MAX];
     if (!file_path(config, f, path, sizeof(path))) {
+        if (file_fd != -1) {
+            close(file_fd);
+        }
         return;
     }
     mask |= f->pending;
@@ -1824,7 +1879,8 @@ static void fire_file(event_loop *loop, file_entry *f, uint32_t mask, int quiet,
     }
     f->pending = 0;
     f->last_fire = loop->now;
-    int fd = open_file(config, f);
+    int fd = file_fd != -1 ? file_fd : open_file(config, f);
+    int gone = fd == -1 && errno == ENOENT;
     char io_path[FD_PATH_LEN];
     struct stat st;
     if (fd != -1 && fstat(fd, &st) == 0) {
@@ -1855,6 +1911,12 @@ static void fire_file(event_loop *loop, file_entry *f, uint32_t mask, int quiet,
     if (fd != -1) {
         close(fd);
     }
+    if (gone && cache_of(f) && (mask & (IN_MODIFY | IN_IGNORED))) {
+        // Gone from its name before the change could be diffed: kept until
+        // the event that says where it went. A file moved out takes the
+        // change along, to be diffed if it comes back (see take_departed())
+        defer(config, f, mask & (IN_MODIFY | IN_IGNORED));
+    }
 }
 
 // Handle the deferred events whose debounce window has closed, and the
@@ -1877,6 +1939,13 @@ static int run_due(event_loop *loop) {
         }
         int fd = open_file(config, f);
         struct stat st;
+        if (fd == -1 && errno == ENOENT) {
+            // Gone from its name: its event, still to come, says where to
+            f->last_fire = loop->now;
+            next = next < 0 || loop->now + loop->window < next ? loop->now + loop->window : next;
+            i++;
+            continue;
+        }
         // Events that came after the change was handled but belong to it (a
         // close after the write) leave nothing new to show
         int same = fd == -1 || (fstat(fd, &st) == 0 && st.st_size == f->fired_size &&
@@ -2011,9 +2080,12 @@ static void entry_left(sqwatch_config *config, dir_entry *dir, const char *name,
         printf(DARK_GREY "+ File no longer exists: %s\n" RESET,
                shown_name(file_path(config, f, path, sizeof(path)) ?: name));
     }
-    if (moved && f->inode && f->inode->count == 1 && f->inode->cached) {
-        // An editor may make a new file under the name in a moment
-        departed_add(dir, name, NULL, take_history(config, f));
+    if (moved) {
+        // An editor may make a new file under the name in a moment, or the
+        // file may come back
+        departed_add(dir, name, NULL, f,
+                     f->inode && f->inode->count == 1 && f->inode->cached ?
+                         take_history(config, f) : NULL);
     }
     file_free(config, f);
 }
@@ -2053,8 +2125,12 @@ static void entry_renamed(event_loop *loop, dir_entry *from, const char *from_na
     }
     file_entry *there = file_find(config, to, to_name);
     if (there) {
-        // The name keeps its history; the file that moved there is diffed
-        // against it
+        // Its own changes not handled yet are handled first, against its own
+        // cache entry. Then the name keeps its history; the file that moved
+        // there is diffed against it
+        if (f->pending) {
+            fire_file_fd(loop, f, 0, 0, 1, to_fd == -1 ? -1 : open_file_at(to_fd, to_name));
+        }
         dev_t dev = f->inode ? f->inode->dev : 0;
         ino_t ino = f->inode ? f->inode->ino : 0;
         file_free(config, f);
@@ -2066,7 +2142,7 @@ static void entry_renamed(event_loop *loop, dir_entry *from, const char *from_na
     }
     if (file_rename(config, f, to, to_name) == 0) {
         f->root = root_of(config, to, to_name);
-        departed_add(from, from_name, f, NULL);
+        departed_add(from, from_name, f, NULL, NULL);
     }
 }
 
@@ -2329,8 +2405,17 @@ static void diff_changed(event_loop *loop) {
             continue;
         }
         // A file just created may not be written yet: the write, which its
-        // directory's watch now sees, is diffed then
+        // directory's watch now sees, is diffed then. A file that came back
+        // without events of its own is diffed only if it differs
         int unwritten = why == CHANGED_CREATED && fstat(fd, &st) == 0 && st.st_size == 0;
+        if (why == CHANGED_RETURNED && !f->pending) {
+            char io_path[FD_PATH_LEN];
+            fd_path(fd, io_path, sizeof(io_path));
+            own_reads(config, f->dir, 1);
+            unwritten = !config->diff_enabled || !cache_of(f) ||
+                        !cache_differs(io_path, cache_of(f));
+            own_reads(config, f->dir, 0);
+        }
         close(fd);
         if (!unwritten) {
             fire_file(loop, f, why == CHANGED_RESCAN ? IN_MODIFY : IN_IGNORED,
@@ -2417,14 +2502,30 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
         }
 
         size_t i = 0;
+        int carried = 0;  // The first event in buffer was carried over
         while (i + EVENT_SIZE <= (size_t)length) {
             // A buffer of events can take long to handle: leave between them
             // if a signal is waiting
             stop_if_signalled();
             struct inotify_event *event = (struct inotify_event *)&buffer[i];
+            size_t at = i;
             i += EVENT_SIZE + event->len;
             struct inotify_event *next = i + EVENT_SIZE <= (size_t)length ?
                 (struct inotify_event *)&buffer[i] : NULL;
+            size_t size = EVENT_SIZE + event->len;
+            if (!next && (event->mask & IN_MOVED_FROM) && !(carried && at == 0) &&
+                size <= BUF_LEN / 2) {
+                // The other half of a rename may be the first event of the
+                // next read: carry this one over to it, waiting a moment
+                memmove(buffer, event, size);
+                carried = 1;
+                struct pollfd more_fd = {inotify_fd, POLLIN, 0};
+                ssize_t more = poll(&more_fd, 1, 20) == 1 ?
+                    read(inotify_fd, buffer + size, BUF_LEN - size) : -1;
+                length = (ssize_t)size + (more > 0 ? more : 0);
+                i = 0;
+                continue;
+            }
             loop.now = now_ms();
 
             if (event->wd < 0) {

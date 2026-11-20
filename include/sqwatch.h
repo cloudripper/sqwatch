@@ -97,6 +97,7 @@ struct file_entry {
 #define CHANGED_TAKEOVER 1   // Took over the cache entry of a name it replaced
 #define CHANGED_CREATED 2    // The same, when it was created under the name
 #define CHANGED_RESCAN 3     // Found to differ from its cache entry in a rescan
+#define CHANGED_RETURNED 4   // Came back into the tree a moment after it left
 
 // A hash table with chains; what the chains link depends on the table
 typedef struct {

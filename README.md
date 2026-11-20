@@ -63,7 +63,7 @@ Basic syntax:
 sqwatch -d DIR | -f FILE [options]
 ```
 
-How files are watched: sqwatch watches directories, one inotify watch each, and sees what happens to the files in them through those watches, by name. A `-f FILE` is watched through the watch of its directory, limited to that name, so it is still followed when it is deleted and made again, or replaced by an editor. Each name of a file with hard links is a file of its own; a change made through a name outside the watched trees is not seen. When a watch cannot be set (for example, the inotify watch limit `fs.inotify.max_user_watches` is reached), sqwatch says so once, loudly, and runs the command as after lost events (`SQWATCH_EVENT=overflow`): what is beneath that directory is not seen.
+How files are watched: sqwatch watches directories, one inotify watch each, and sees what happens to the files in them through those watches, by name. A `-f FILE` is watched through the watch of its directory, limited to that name, so it is still followed when it is deleted and made again, or replaced by an editor. Each name of a file with hard links is a file of its own; a change made through a name outside the watched trees is not seen. A file moved out of the tree and back in within a few seconds, under any name, keeps what sqwatch knew of it: a change made before it left is still diffed, against what it held before. When a watch cannot be set (for example, the inotify watch limit `fs.inotify.max_user_watches` is reached), sqwatch says so once, loudly, and runs the command as after lost events (`SQWATCH_EVENT=overflow`): what is beneath that directory is not seen.
 
 Watch:
 - `-d DIR`: Directory to watch, with everything beneath it (repeatable)
