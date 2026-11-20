@@ -98,7 +98,8 @@ typedef struct {
     size_t pending_size;
     watch_root *roots;       // One per -d or -f
     int root_count;
-    unsigned debounce_t;     // Seconds
+    long long debounce_ms;   // The debounce time
+    int debounce_set;        // Given with -t
     int verbose;
     int diff_enabled;        // New flag for diff functionality
     const char *log_file;

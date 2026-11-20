@@ -60,25 +60,40 @@ sudo install -D ./sqwatch /usr/local/bin/sqwatch
 
 Basic syntax:
 ```bash
-sqwatch [-d directory] [-f file] -q event [-c command] [--diff] [-l log_file] [-t debounce_time] [-v]
+sqwatch -d DIR | -f FILE [options]
 ```
 
-Options:
-- `-d directory`: Directory to watch (recursively)
-- `-f file`: File to watch
-- `-q event`: Event type to watch
-  - `all`: all events
-  - `modify`: file modifications
-  - `create`: file creation
-  - `delete`: file deletion
-  - `move`: file moves
-  - `attrib`: attribute changes
-- `-c command`: Command to execute when events are detected
-- `--diff`: Enable diff tracking for file changes
-- `-l log_file`: Log file to write changes to (requires --diff)
-- `-t debounce_time`: Time in seconds to wait before processing new events (default: 1)
-- `-v`: Verbose output mode
-- `-h`: Display help message
+Watch:
+- `-d DIR`: Directory to watch, with everything beneath it (repeatable)
+- `-f FILE`: File to watch (repeatable)
+- `-q EVENTS`: Events to react to, separated by commas, for example `-q modify,create` (default: `modify`)
+  - `modify`: a file was written
+  - `create`: a file or directory was created
+  - `delete`: a file or directory was deleted
+  - `move`: a file or directory was moved or renamed
+  - `attrib`: mode, owner or times changed
+  - `all`: all of the above
+
+Command:
+- `-c COMMAND`: Run COMMAND with `/bin/sh -c` on each change; a run still going is stopped and started again
+- `-t SECONDS`: Debounce time of each file, a decimal number of seconds such as `2` or `0.25`, from 0 to 86400 (default: 1)
+
+Diff:
+- `--diff`: Show what changed in each file, from a private cache
+- `-l FILE`: Also write the diffs to FILE (needs `--diff`)
+
+Other:
+- `-v`: Verbose output
+- `-h`, `--help`: Display the help message
+
+Every option is checked when sqwatch starts. A value that cannot be used ends it with exit status 1, a message that names the option and the value, and the values that option takes:
+
+```
+$ sqwatch -d src -q modfy
+sqwatch: -q 'modfy': 'modfy' is not an event
+-q EVENTS: one or more of modify, create, delete, move, attrib, all,
+  separated by commas, for example -q modify,create
+```
 
 Examples:
 ```bash
@@ -89,7 +104,7 @@ sqwatch -f main.c -q modify -c "gcc main.c -o program && ./program"
 sqwatch -d src/ -q all --diff -l changes.log -v
 
 # Watch directory with custom debounce time
-sqwatch -d src/ -q modify -t 2 -c "make test"
+sqwatch -d src/ -q modify -t 0.5 -c "make test"
 ```
 
 ## Environment Variables

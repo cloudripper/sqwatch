@@ -1727,7 +1727,7 @@ static void diff_changed(event_loop *loop) {
 // signal_fd, and return that signal; SIGTERM if the events cannot be read
 int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
     char buffer[BUF_LEN];
-    event_loop loop = {inotify_fd, config, 0, (long long)config->debounce_t * 1000, 0, 0, 0};
+    event_loop loop = {inotify_fd, config, 0, config->debounce_ms, 0, 0, 0};
 
     while (1) {
         // stdout is polled for an error only: its reader went away
@@ -1795,24 +1795,34 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
 }
 
 void print_usage(void) {
-    printf("Usage: sqwatch [-d directory] [-f file] [-t debounce time] -q event [-c command] [--diff] [-l log_file]\n");
-    printf("Options:\n");
-    printf("  -d directory      Directory to watch\n");
-    printf("  -f file           File to watch\n");
-    printf("  -q event          Event type to watch\n");
-    printf("                     all: all events\n");
-    printf("                     modify: file modifications\n");
-    printf("                     create: file creation\n");
-    printf("                     delete: file deletion\n");
-    printf("                     move: file moves\n");
-    printf("                     attrib: attribute changes\n");
-    printf("  -t debounce time  (Optional) Time (in seconds) after trigger to ignore events\n");
-    printf("  -c command        (Optional) Command to execute when events are detected\n");
-    printf("  --diff            Enable diff functionality to show file changes\n");
-    printf("  -l log_file       (Optional) Log file to write changes to (requires --diff)\n");
-    printf("  -v                (Optional) Use verbose output (does not affect command output)\n");
-    printf("  -h                Display this help message\n");
-    printf("\nExamples:\n");
-    printf("  sqwatch -d src -q modify --diff              # Watch src directory and show diffs\n");
-    printf("  sqwatch -f config.txt -q all --diff -l changes.log  # Watch file with logging\n");
+    printf("Usage: sqwatch -d DIR | -f FILE [options]\n"
+           "\n"
+           "Watch:\n"
+           "  -d DIR         Directory to watch, with everything beneath it (repeatable)\n"
+           "  -f FILE        File to watch (repeatable)\n"
+           "  -q EVENTS      Events to react to, separated by commas (default: modify):\n"
+           "                   modify   a file was written\n"
+           "                   create   a file or directory was created\n"
+           "                   delete   a file or directory was deleted\n"
+           "                   move     a file or directory was moved or renamed\n"
+           "                   attrib   mode, owner or times changed\n"
+           "                   all      all of the above\n"
+           "\n"
+           "Command:\n"
+           "  -c COMMAND     Run COMMAND with /bin/sh -c on each change; a run still going\n"
+           "                 is stopped and started again\n"
+           "  -t SECONDS     Debounce time of each file, a decimal number (default: 1)\n"
+           "\n"
+           "Diff:\n"
+           "  --diff         Show what changed in each file, from a private cache\n"
+           "  -l FILE        Also write the diffs to FILE (needs --diff)\n"
+           "\n"
+           "Other:\n"
+           "  -v             Verbose output\n"
+           "  -h, --help     Show this help\n"
+           "\n"
+           "Examples:\n"
+           "  sqwatch -d src -q modify --diff              # Show diffs of files in src\n"
+           "  sqwatch -f config.txt -q all --diff -l changes.log  # Log every change\n"
+           "  sqwatch -d src -t 0.5 -c 'make test'         # Run the tests on each change\n");
 }

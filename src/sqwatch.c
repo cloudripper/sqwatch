@@ -101,6 +101,160 @@ void stop_if_signalled(void) {
   }
 }
 
+// The values each option takes, shown after an error in its value
+static const char *option_help(int opt) {
+  switch (opt) {
+  case 'd': return "-d DIR: an existing directory, watched with everything beneath it";
+  case 'f': return "-f FILE: an existing regular file";
+  case 'c': return "-c COMMAND: a shell command, run with /bin/sh -c";
+  case 't': return "-t SECONDS: a decimal number of seconds from 0 to 86400, for example 1 or 0.25";
+  case 'q': return "-q EVENTS: one or more of modify, create, delete, move, attrib, all,\n"
+                   "  separated by commas, for example -q modify,create";
+  case 'l': return "-l FILE: the log file for diffs (with --diff)";
+  default: return NULL;
+  }
+}
+
+// The value of option opt is not valid: say why and what it takes, and exit
+static void bad_value(int opt, const char *value, const char *problem) {
+  fprintf(stderr, "sqwatch: -%c '%s': %s\n", opt, shown_name(value), problem);
+  if (option_help(opt)) {
+    fprintf(stderr, "%s\n", option_help(opt));
+  }
+  exit(EXIT_FAILURE);
+}
+
+static void missing_argument(int opt) {
+  fprintf(stderr, "sqwatch: -%c needs a value\n", opt);
+  if (option_help(opt)) {
+    fprintf(stderr, "%s\n", option_help(opt));
+  }
+  fprintf(stderr, "see sqwatch -h\n");
+  exit(EXIT_FAILURE);
+}
+
+static void unknown_option(int opt, const char *arg) {
+  if (opt) {
+    char text[2] = {(char)opt, '\0'};
+    fprintf(stderr, "sqwatch: unknown option -%s\n", shown_name(text));
+  } else {
+    fprintf(stderr, "sqwatch: unknown option %s\n", shown_name(arg));
+  }
+  fprintf(stderr, "see sqwatch -h\n");
+  exit(EXIT_FAILURE);
+}
+
+// Parse a decimal number of seconds, such as 2, 0.25 or .5, into *ms, rounded
+// to the nearest millisecond. Signs, exponents, hex, inf and nan are not
+// numbers here, and nothing over a day is taken. Returns 0, or -1
+static int parse_seconds(const char *text, long long *ms) {
+  long long whole = 0, frac = 0;
+  int digits = 0, places = 0, round_up = 0;
+  const char *p = text;
+  while (*p >= '0' && *p <= '9') {
+    whole = whole * 10 + (*p++ - '0');
+    digits++;
+    if (whole > 86400) {
+      return -1;
+    }
+  }
+  if (*p == '.') {
+    for (p++; *p >= '0' && *p <= '9'; p++, digits++) {
+      if (places < 3) {
+        frac = frac * 10 + (*p - '0');
+        places++;
+      } else if (places++ == 3) {
+        round_up = *p >= '5';
+      }
+    }
+  }
+  if (!digits || *p != '\0') {
+    return -1;
+  }
+  while (places < 3) {
+    frac *= 10;
+    places++;
+  }
+  long long value = whole * 1000 + frac + round_up;
+  if (value > 86400LL * 1000) {
+    return -1;
+  }
+  *ms = value;
+  return 0;
+}
+
+// A number of milliseconds as seconds, without trailing zeros: 1, 0.25
+static const char *format_seconds(long long ms) {
+  static char text[32];
+  int len = snprintf(text, sizeof(text), "%lld.%03lld", ms / 1000, ms % 1000);
+  while (len > 0 && text[len - 1] == '0') {
+    text[--len] = '\0';
+  }
+  if (len > 0 && text[len - 1] == '.') {
+    text[--len] = '\0';
+  }
+  return text;
+}
+
+// The inotify events of a -q list: names separated by commas. Returns 0 and
+// sets *problem if a name is not known or the list is empty
+static uint32_t parse_events(const char *list, const char **problem) {
+  static const struct {
+    const char *name;
+    uint32_t mask;
+  } names[] = {
+    {"modify", IN_MODIFY | IN_CLOSE_WRITE},
+    {"create", IN_CREATE},
+    {"delete", IN_DELETE},
+    {"move", IN_MOVE},
+    {"attrib", IN_ATTRIB},
+    {"all", IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVE | IN_ATTRIB | IN_CLOSE_WRITE},
+  };
+  static char why[64];
+  uint32_t mask = 0;
+  const char *p = list;
+  while (1) {
+    size_t len = strcspn(p, ",");
+    size_t n = 0;
+    while (n < sizeof(names) / sizeof(names[0]) &&
+           (strlen(names[n].name) != len || strncmp(names[n].name, p, len) != 0)) {
+      n++;
+    }
+    if (n == sizeof(names) / sizeof(names[0])) {
+      if (len == 0) {
+        *problem = "an empty event name";
+      } else {
+        snprintf(why, sizeof(why), "'%.*s' is not an event", len > 32 ? 32 : (int)len, p);
+        *problem = shown_name(why);
+      }
+      return 0;
+    }
+    mask |= names[n].mask;
+    if (p[len] == '\0') {
+      return mask;
+    }
+    p += len + 1;
+  }
+}
+
+// Say which events are watched
+static void announce_events(uint32_t flags) {
+  static const struct {
+    const char *name;
+    uint32_t mask;
+  } names[] = {
+    {"modify", IN_MODIFY}, {"create", IN_CREATE}, {"delete", IN_DELETE},
+    {"move", IN_MOVE}, {"attrib", IN_ATTRIB},
+  };
+  printf(GREEN "+ Monitoring events:");
+  for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); n++) {
+    if (flags & names[n].mask) {
+      printf(" %s", names[n].name);
+    }
+  }
+  printf("\n" RESET);
+}
+
 int main(int argc, char *argv[]) {
   // SIGINT, SIGTERM and SIGHUP (the terminal closed) stay blocked and are
   // read from a signalfd by handle_events(), so the cache is removed here,
@@ -127,9 +281,10 @@ int main(int argc, char *argv[]) {
   char **paths = calloc(argc, sizeof(*paths));
   int path_count = 0;
   int opt;
-  unsigned debounce_t = 1;
+  long long debounce_ms = 1000;
   char *log_file = NULL;
   int verbose = 0;
+  uint32_t flags = 0;
 
   int inotify_fd = -1;
   config.roots = calloc(argc, sizeof(*config.roots));
@@ -139,122 +294,70 @@ int main(int argc, char *argv[]) {
   }
   config.root_count = 0;
 
-  // Determine the default cache directory
   inotify_fd = inotify_init1(IN_CLOEXEC);
   if (inotify_fd == -1) {
     perror("inotify_init");
     exit(EXIT_FAILURE);
   }
-  int flags = IN_MODIFY;
 
   static struct option long_options[] = {
     {"diff", no_argument, 0, 'D'},
+    {"help", no_argument, 0, 'h'},
     {0, 0, 0, 0}
   };
 
-  while ((opt = getopt_long(argc, argv, "d:f:t:q:c:l:vh", long_options, NULL)) != -1) {
+  // Errors are reported here, not by getopt: a leading ':' tells a missing
+  // argument from an unknown option
+  opterr = 0;
+  while ((opt = getopt_long(argc, argv, ":d:f:t:q:c:l:vh", long_options, NULL)) != -1) {
+    struct stat statbuf;
     switch (opt) {
     case 'd':
-      paths[path_count++] = optarg;
-
-      // Check if the specified path is a directory
-      {
-        struct stat statbuf;
-        if (stat(optarg, &statbuf) != 0 || !S_ISDIR(statbuf.st_mode)) {
-          fprintf(stderr, "Error: %s is not a valid directory.\n", shown_name(optarg));
-          exit(EXIT_FAILURE);
-        }
+      if (stat(optarg, &statbuf) != 0) {
+        bad_value('d', optarg, strerror(errno));
+      } else if (!S_ISDIR(statbuf.st_mode)) {
+        bad_value('d', optarg, "not a directory");
       }
+      paths[path_count++] = optarg;
       break;
     case 'f':
-      paths[path_count++] = optarg;
-
-      // Check if the specified path is a file
-      {
-        struct stat statbuf;
-        if (stat(optarg, &statbuf) != 0 || !S_ISREG(statbuf.st_mode)) {
-          fprintf(stderr, "Error: %s is not a valid file.\n", shown_name(optarg));
-          exit(EXIT_FAILURE);
-        }
+      if (stat(optarg, &statbuf) != 0) {
+        bad_value('f', optarg, strerror(errno));
+      } else if (!S_ISREG(statbuf.st_mode)) {
+        bad_value('f', optarg, S_ISDIR(statbuf.st_mode) ? "a directory, not a file (use -d)" :
+                                                          "not a regular file");
       }
+      paths[path_count++] = optarg;
       break;
     case 'c':
-      if (optarg && strlen(optarg) > 0) {
-        command = optarg;
+      if (optarg[0] == '\0') {
+        bad_value('c', optarg, "the command is empty");
       }
+      command = optarg;
       break;
     case 't':
-      debounce_t = atoi(optarg) > 0 ? atoi(optarg) : 0;
-      printf(DARK_GREY "+ Debounce set to %u\n" RESET, debounce_t);
-      break;
-    case 'q':
-      if (strcmp(optarg, "all") == 0) {
-        flags = IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVE | IN_ATTRIB | IN_CLOSE_WRITE;
-        printf(GREEN "+ Monitoring all events enabled\n" RESET);
-      } else if (strcmp(optarg, "modify") == 0) {
-        flags = IN_MODIFY | IN_CLOSE_WRITE;
-        printf(GREEN "+ Monitoring modify event enabled\n" RESET);
-      } else if (strcmp(optarg, "create") == 0) {
-        flags = IN_CREATE;
-        printf(GREEN "+ Monitoring create event enabled\n" RESET);
-      } else if (strcmp(optarg, "delete") == 0) {
-        flags = IN_DELETE;
-        printf(GREEN "+ Monitoring delete event enabled\n" RESET);
-      } else if (strcmp(optarg, "move") == 0) {
-        flags = IN_MOVE;
-        printf(GREEN "+ Monitoring move event enabled\n" RESET);
-      } else if (strcmp(optarg, "attrib") == 0) {
-        flags = IN_ATTRIB;
-        printf(GREEN "+ Monitoring attribute events enabled\n" RESET);
-      } else {
-        fprintf(stderr, "Invalid query option: %s\n", shown_name(optarg));
-        print_usage();
-        exit(EXIT_FAILURE);
+      if (parse_seconds(optarg, &debounce_ms) != 0) {
+        bad_value('t', optarg, "not a number of seconds");
       }
+      config.debounce_set = 1;
       break;
+    case 'q': {
+      const char *problem = NULL;
+      uint32_t asked = parse_events(optarg, &problem);
+      if (!asked) {
+        bad_value('q', optarg, problem);
+      }
+      flags |= asked;
+      break;
+    }
     case 'l':
-      if (optarg && strlen(optarg) > 0) {
-        log_file = optarg; // log file/directory
+      if (optarg[0] == '\0') {
+        bad_value('l', optarg, "the path is empty");
       }
-
+      log_file = optarg; // log file/directory
       break;
     case 'D':
       config.diff_enabled = 1;
-      printf(DARK_GREY "+ Diff mode enabled\n" RESET);
-      // Check for SQWATCH_CACHE_DIR environment variable
-      const char *sqwatch_cache_dir = getenv("SQWATCH_CACHE_DIR");
-      if (sqwatch_cache_dir) {
-        if (asprintf(&cache_dir, "%s", sqwatch_cache_dir) < 0) {
-          perror("Failed to allocate memory for cache_dir");
-          exit(EXIT_FAILURE);
-        }
-        printf(DARK_GREY "+ Cache set. Using SQWATCH_CACHE_DIR: %s\n" RESET,
-               shown_name(cache_dir));
-      } else {
-        // The XDG spec says to ignore an empty or relative XDG_CACHE_HOME
-        const char *xdg_cache_home = getenv("XDG_CACHE_HOME");
-        if (!xdg_cache_home || xdg_cache_home[0] != '/') {
-          xdg_cache_home = getenv("HOME");
-          if (xdg_cache_home) {
-            if (asprintf(&cache_dir, "%s/.cache/sqwatch", xdg_cache_home) < 0) {
-              perror("Failed to allocate memory for cache_dir");
-              exit(EXIT_FAILURE);
-            }
-            printf(
-                DARK_GREY
-                "+ Cache set. Using XDG_CACHE_HOME: %s/.cache/sqwatch\n" RESET,
-                shown_name(xdg_cache_home));
-          }
-        } else {
-          if (asprintf(&cache_dir, "%s/sqwatch", xdg_cache_home) < 0) {
-            perror("Failed to allocate memory for cache_dir");
-            exit(EXIT_FAILURE);
-          }
-          printf(DARK_GREY
-                 "+ Cache set.Using default cache directory: %s\n" RESET,
-                 shown_name(cache_dir));
-        }
-      }
       break;
     case 'v':
       verbose = 1;
@@ -262,28 +365,84 @@ int main(int argc, char *argv[]) {
     case 'h':
       print_usage();
       exit(EXIT_SUCCESS);
+    case ':':
+      missing_argument(optopt);
+      break;
     default:
-      print_usage();
-      exit(EXIT_FAILURE);
+      unknown_option(optopt, argv[optind - 1]);
+      break;
     }
   }
 
-  if (path_count == 0) {
-    fprintf(stderr, "No paths specified\n");
-    print_usage();
+  if (optind < argc) {
+    fprintf(stderr, "sqwatch: unexpected argument '%s': paths to watch go after -d or -f\n"
+                    "see sqwatch -h\n", shown_name(argv[optind]));
     exit(EXIT_FAILURE);
+  }
+  if (path_count == 0) {
+    fprintf(stderr, "sqwatch: nothing to watch: give -d DIR or -f FILE\nsee sqwatch -h\n");
+    exit(EXIT_FAILURE);
+  }
+  if (log_file && !config.diff_enabled) {
+    fprintf(stderr, "sqwatch: -l needs --diff: the log holds the diffs\nsee sqwatch -h\n");
+    exit(EXIT_FAILURE);
+  }
+  if (!flags) {
+    flags = IN_MODIFY | IN_CLOSE_WRITE;  // -q modify
+  }
+  announce_events(flags);
+  if (config.debounce_set) {
+    printf(DARK_GREY "+ Debounce set to %s s\n" RESET, format_seconds(debounce_ms));
+  }
+
+  if (config.diff_enabled) {
+    printf(DARK_GREY "+ Diff mode enabled\n" RESET);
+    // Check for SQWATCH_CACHE_DIR environment variable
+    const char *sqwatch_cache_dir = getenv("SQWATCH_CACHE_DIR");
+    if (sqwatch_cache_dir) {
+      if (asprintf(&cache_dir, "%s", sqwatch_cache_dir) < 0) {
+        perror("Failed to allocate memory for cache_dir");
+        exit(EXIT_FAILURE);
+      }
+      printf(DARK_GREY "+ Cache set. Using SQWATCH_CACHE_DIR: %s\n" RESET,
+             shown_name(cache_dir));
+    } else {
+      // The XDG spec says to ignore an empty or relative XDG_CACHE_HOME
+      const char *xdg_cache_home = getenv("XDG_CACHE_HOME");
+      if (!xdg_cache_home || xdg_cache_home[0] != '/') {
+        xdg_cache_home = getenv("HOME");
+        if (xdg_cache_home) {
+          if (asprintf(&cache_dir, "%s/.cache/sqwatch", xdg_cache_home) < 0) {
+            perror("Failed to allocate memory for cache_dir");
+            exit(EXIT_FAILURE);
+          }
+          printf(
+              DARK_GREY
+              "+ Cache set. Using XDG_CACHE_HOME: %s/.cache/sqwatch\n" RESET,
+              shown_name(xdg_cache_home));
+        }
+      } else {
+        if (asprintf(&cache_dir, "%s/sqwatch", xdg_cache_home) < 0) {
+          perror("Failed to allocate memory for cache_dir");
+          exit(EXIT_FAILURE);
+        }
+        printf(DARK_GREY
+               "+ Cache set.Using default cache directory: %s\n" RESET,
+               shown_name(cache_dir));
+      }
+    }
   }
 
   // The log is only written by diffs. It is opened here, once; a log that
   // cannot be used safely ends the run
-  if (log_file && config.diff_enabled) {
+  if (log_file) {
     if (open_log_file(log_file) != 0) {
       exit(EXIT_FAILURE);
     }
     printf(DARK_GREY "+ Logging to %s\n" RESET, shown_name(log_file));
   }
 
-  config.debounce_t = debounce_t;
+  config.debounce_ms = debounce_ms;
   config.verbose = verbose;
   config.log_file = log_file;
   config.command = command;
