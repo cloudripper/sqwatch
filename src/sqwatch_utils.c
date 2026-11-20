@@ -2569,11 +2569,13 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
                 continue;
             }
             perror("poll");
+            free(loop.command_path);
             return SIGTERM;  // Leave through cleanup() all the same
         }
         if (fds[1].revents & POLLIN) {
             struct signalfd_siginfo info;
             if (read(signal_fd, &info, sizeof(info)) == (ssize_t)sizeof(info)) {
+                free(loop.command_path);
                 return (int)info.ssi_signo;
             }
         }
@@ -2589,6 +2591,7 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
                 continue;
             }
             perror("inotify read");
+            free(loop.command_path);
             return SIGTERM;
         }
 

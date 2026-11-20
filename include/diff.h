@@ -30,11 +30,13 @@
 
 // A file read whole into one buffer, each line ended by a NUL in place of its
 // newline. Line i starts at data + start[i]; start[count] is one past the
-// NUL of the last line. data is NULL for an empty file
+// NUL of the last line. data is NULL for an empty file. no_newline is set if
+// the last line has no newline at its end
 typedef struct {
     char *data;
     uint32_t *start;
     int count;
+    int no_newline;
 } file_lines;
 
 // Lines removed from the cached copy and lines added in the current file at

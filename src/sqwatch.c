@@ -151,7 +151,17 @@ static void missing_argument(int opt) {
 }
 
 static void unknown_option(int opt, const char *arg) {
-  if (opt) {
+  const char *eq = arg && strncmp(arg, "--", 2) == 0 ? strchr(arg, '=') : NULL;
+  if (eq) {
+    // A long option given a value it does not take: name the long option
+    char name[32];
+    snprintf(name, sizeof(name), "%.*s", (int)(eq - arg), arg);
+    if (strcmp(name, "--diff") == 0 || strcmp(name, "--help") == 0) {
+      fprintf(stderr, "sqwatch: %s: %s takes no value\nsee sqwatch -h\n", shown_name(arg), name);
+      exit(EXIT_FAILURE);
+    }
+  }
+  if (opt && !(arg && strncmp(arg, "--", 2) == 0)) {
     char text[2] = {(char)opt, '\0'};
     fprintf(stderr, "sqwatch: unknown option -%s\n", shown_name(text));
   } else {

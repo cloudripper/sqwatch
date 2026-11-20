@@ -54,7 +54,7 @@ enum { READ_OK, READ_LEASED, READ_TOO_LARGE, READ_TOO_MANY_LINES };
 // on it, or it is over DIFF_MAX_BYTES or DIFF_MAX_LINES; *size is then its size
 static file_lines read_file_lines(const char *filename, const char *io_path, int cache_side,
                                   int *why, long long *size) {
-  file_lines fl = {NULL, NULL, 0};
+  file_lines fl = {NULL, NULL, 0, 0};
   int retry_count = 0;
   FILE *file = NULL;
   *why = READ_OK;
@@ -77,30 +77,10 @@ static file_lines read_file_lines(const char *filename, const char *io_path, int
     return fl;
   }
 
-  // Get file size with retries for empty files
   struct stat st;
-  retry_count = 0;
   int fd = fileno(file);
-  while (retry_count < 5) { // Try up to 5 times
-    if (fstat(fd, &st) < 0) {
-      fprintf(stderr, RED "Failed to stat %s: %s\n" RESET, shown_name(filename),
-              strerror(errno));
-      fclose(file);
-      return fl;
-    }
-
-    if (st.st_size > 0) {
-      break; // File has content, proceed
-    }
-
-    // Wait before retry
-    usleep(50000); // 50ms delay between attempts
-    retry_count++;
-  }
-
-  if (st.st_size == 0) {
-    fprintf(stderr, DARK_GREY "File %s is empty after %d attempts\n" RESET, shown_name(filename),
-            retry_count);
+  if (fstat(fd, &st) < 0) {
+    fprintf(stderr, RED "Failed to stat %s: %s\n" RESET, shown_name(filename), strerror(errno));
     fclose(file);
     return fl;
   }
@@ -111,24 +91,33 @@ static file_lines read_file_lines(const char *filename, const char *io_path, int
     return fl;
   }
 
-  // Read it all, one MiB at a time; it may have grown since fstat()
+  // Read it all, one MiB at a time; it may have grown since fstat(). The
+  // buffer grows only if a byte past what it holds is there to read
   size_t length = 0, room = (size_t)st.st_size + 1;
   char *data = malloc(room);
   while (data) {
     if (length + 1 == room) {
-      if (room > DIFF_MAX_BYTES) {
-        *why = READ_TOO_LARGE;
-        *size = (long long)length;
+      char more;
+      ssize_t got = read(fd, &more, 1);
+      if (got <= 0) {
         break;
       }
-      char *grown = realloc(data, room * 2 > DIFF_MAX_BYTES + 2 ? DIFF_MAX_BYTES + 2 : room * 2);
+      if (length + 1 > DIFF_MAX_BYTES) {
+        *why = READ_TOO_LARGE;
+        *size = (long long)length + 1;
+        break;
+      }
+      size_t new_room = room * 2 > DIFF_MAX_BYTES + 1 ? DIFF_MAX_BYTES + 1 : room * 2;
+      char *grown = realloc(data, new_room);
       if (!grown) {
         free(data);
         data = NULL;
         break;
       }
-      room = room * 2 > DIFF_MAX_BYTES + 2 ? DIFF_MAX_BYTES + 2 : room * 2;
+      room = new_room;
       data = grown;
+      data[length++] = more;
+      continue;
     }
     size_t want = room - 1 - length;
     ssize_t n = read(fd, data + length, want > (1 << 20) ? (1 << 20) : want);
@@ -156,6 +145,7 @@ static file_lines read_file_lines(const char *filename, const char *io_path, int
   }
   if (data[length - 1] != '\n') {
     lines++;
+    fl.no_newline = 1;
   }
   if (lines > DIFF_MAX_LINES) {
     *why = READ_TOO_MANY_LINES;
@@ -190,7 +180,17 @@ static const char *line_at(const file_lines *fl, int i) {
   return fl->data + fl->start[i];
 }
 
+// Whether line i is the last line of fl with no newline after it
+static int unended(const file_lines *fl, int i) {
+  return fl->no_newline && i == fl->count - 1;
+}
+
+// A line with no newline after it is not the same as one with one, as in
+// diff(1)
 static int same_line(const file_lines *a, int i, const file_lines *b, int j) {
+  if (unended(a, i) != unended(b, j)) {
+    return 0;
+  }
   uint32_t len = a->start[i + 1] - a->start[i];
   return len == b->start[j + 1] - b->start[j] && memcmp(line_at(a, i), line_at(b, j), len) == 0;
 }
@@ -341,6 +341,8 @@ static int hunk_at_end(const diff_hunk *hunk, const file_lines *current,
   return hunk->cached_at == cached->count || hunk->current_at == current->count;
 }
 
+#define NO_NEWLINE "\\ No newline at end of file"
+
 // What one shown or logged diff has used of DIFF_SHOW_LINES and
 // DIFF_SHOW_BYTES; the lines past either are counted, not written
 typedef struct {
@@ -384,6 +386,9 @@ void print_diff(const file_lines *current, const file_lines *cached, const diff_
       const char *text = shown_text(line_at(cached, j));
       if (cap_take(&cap, text)) {
         printf(RED "-%d: %s\n" RESET, j + 1, text);
+        if (unended(cached, j)) {
+          printf(DARK_GREY NO_NEWLINE "\n" RESET);
+        }
       }
     }
     for (int i = hunks[h].current_at; i < hunks[h].current_at + hunks[h].added; i++) {
@@ -391,6 +396,9 @@ void print_diff(const file_lines *current, const file_lines *cached, const diff_
       const char *text = shown_text(line_at(current, i));
       if (cap_take(&cap, text)) {
         printf(GREEN "+%d: %s\n" RESET, i + 1, text);
+        if (unended(current, i)) {
+          printf(DARK_GREY NO_NEWLINE "\n" RESET);
+        }
       }
     }
   }
@@ -450,6 +458,9 @@ void log_changes(const char *log_file, const char *path, const char *event_type,
       const char *text = shown_text(line_at(cached, j));
       if (cap_take(&cap, text)) {
         fprintf(log_fp, "-%d: %s\n", j + 1, text);
+        if (unended(cached, j)) {
+          fprintf(log_fp, NO_NEWLINE "\n");
+        }
       }
     }
     for (int i = hunks[h].current_at; i < hunks[h].current_at + hunks[h].added; i++) {
@@ -457,6 +468,9 @@ void log_changes(const char *log_file, const char *path, const char *event_type,
       const char *text = shown_text(line_at(current, i));
       if (cap_take(&cap, text)) {
         fprintf(log_fp, "+%d: %s\n", i + 1, text);
+        if (unended(current, i)) {
+          fprintf(log_fp, NO_NEWLINE "\n");
+        }
       }
     }
   }
@@ -635,9 +649,13 @@ void run_diff(const char *path, const char *io_path, const char *cached_file_pat
   struct timespec kept_mtime;
   struct stat st;
   int stub = cache_stub(cached_file_path, &kept_size, &kept_mtime);
-  if (stub > 0 || (stat(io_path, &st) == 0 && st.st_size > CACHE_MAX_BYTES)) {
+  int over = stat(io_path, &st) == 0 && st.st_size > CACHE_MAX_BYTES;
+  if (stub > 0 || over) {
     if (cache_differs(io_path, cached_file_path)) {
-      if (stub == STUB_BUDGET) {
+      if (stub == STUB_TOO_LARGE && !over) {
+        snprintf(why, sizeof(why), "not diffed (it was over the %d MiB cache limit, so no copy was kept to compare with; one is kept from now on)",
+                 CACHE_MAX_BYTES >> 20);
+      } else if (stub == STUB_BUDGET) {
         snprintf(why, sizeof(why), "not diffed (the cache is full, %d MiB for all files: only its size and modification time are compared)",
                  CACHE_BUDGET_BYTES >> 20);
       } else {
@@ -679,7 +697,7 @@ void run_diff(const char *path, const char *io_path, const char *cached_file_pat
   int current_why, cached_why = READ_OK;
   long long current_size = 0, cached_size = 0;
   file_lines current = read_file_lines(path, io_path, 0, &current_why, &current_size);
-  file_lines cached = {NULL, NULL, 0};
+  file_lines cached = {NULL, NULL, 0, 0};
   if (current_why != READ_LEASED) {
     cached = read_file_lines(path, cached_file_path, 1, &cached_why, &cached_size);
   }
@@ -725,8 +743,9 @@ void run_diff(const char *path, const char *io_path, const char *cached_file_pat
     } else if (current.data && !cached.data) {
       // New content added to empty file
       printf(GREEN "+ New content added\n" RESET);
+      diff_hunk all = {0, 0, 0, current.count};
+      print_diff(&current, &cached, &all, 1, verbose);
       if (log_file) {
-        diff_hunk all = {0, 0, 0, current.count};
         log_changes(log_file, path, "New content", &current, &cached, &all, 1);
       }
     }

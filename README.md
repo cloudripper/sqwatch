@@ -119,8 +119,8 @@ Every option is checked when sqwatch starts. A value that cannot be used ends it
 ```
 $ sqwatch -d src -q modfy
 sqwatch: -q 'modfy': 'modfy' is not an event
--q EVENTS: one or more of modify, create, delete, move, attrib, all,
-  separated by commas, for example -q modify,create
+-q EVENTS: one or more of modify, create, delete, move, attrib, open,
+  access, all, separated by commas, for example -q modify,create
 ```
 
 Examples:
