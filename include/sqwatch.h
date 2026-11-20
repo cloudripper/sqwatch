@@ -14,8 +14,6 @@
 #define RESET "\033[0m"
 #define EVENT_SIZE (sizeof(struct inotify_event))
 #define BUF_LEN (1024 * (EVENT_SIZE + 16))
-#define MAX_PATHS 100
-#define MAX_DIR_WATCHES 16
 
 
 extern pid_t g_last_pid;
@@ -32,28 +30,34 @@ typedef struct {
     char *rel;               // -f only: name of the watched file inside fd
 } watch_root;
 
+// A watched file or directory, by its watch descriptor
 typedef struct {
-    char *path;
-    int wd;
+    int wd;                  // -1 marks a free slot
+    int is_dir;
+    char *path;              // Displayed path
     int root;                // Index into roots
-} dir_watch;
+    char *cached;            // A file's cache entry, or NULL
+} watch_entry;
+
+// Every watch, keyed by watch descriptor: open addressing with linear
+// probing. The kernel hands out new descriptors as watches come and go, so
+// there is no upper bound on their values and no limit on their number here
+typedef struct {
+    watch_entry *slots;
+    size_t size;             // Number of slots: 0 or a power of two
+    size_t count;            // Slots in use
+} watch_table;
 
 typedef struct {
-    char *watch_paths[MAX_PATHS];
-    char *cached_paths[MAX_PATHS];
-    int watch_roots[MAX_PATHS];  // Root of each file watch, by watch descriptor
-    watch_root roots[MAX_PATHS];
+    watch_table watches;
+    watch_root *roots;       // One per -d or -f
     int root_count;
-    int path_count;
     uint8_t debounce_t;
     int verbose;
     int diff_enabled;        // New flag for diff functionality
     const char *log_file;
     const char *command;
     uint32_t flags;
-    dir_watch *dir_watches;  // Array for directory watches
-    int dir_watch_count;
-    int max_dir_watches;
 } sqwatch_config;
 
 
@@ -62,8 +66,11 @@ typedef struct {
 int add_watch(int inotify_fd, const char *path, int flags);
 void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags, sqwatch_config *config);
 void cache_watched_files(sqwatch_config *config);
-int handle_events(int inotify_fd, int signal_fd, sqwatch_config config);
+int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config);
 void print_usage(void);
+watch_entry *watch_find(watch_table *table, int wd);
+watch_entry *watch_add(watch_table *table, int wd);
+void watch_forget(watch_table *table, int wd);
 void stop_if_signalled(void);
 const char *printable(const char *path, char *buf, size_t size);
 const char *shown_name(const char *name);

@@ -21,7 +21,6 @@
 pid_t g_last_pid = 0;
 char *cache_dir = NULL;
 sqwatch_config config;
-static const int INITIAL_DIR_WATCHES = 16;
 // SIGINT and SIGTERM are read from here; see main()
 static int signal_fd = -1;
 
@@ -98,7 +97,8 @@ int main(int argc, char *argv[]) {
   // them and know when the command's process group is really empty
   prctl(PR_SET_CHILD_SUBREAPER, 1);
   char *command = NULL;
-  char *paths[MAX_PATHS];
+  // Every -d and -f, each of them one argument at least
+  char **paths = calloc(argc, sizeof(*paths));
   int path_count = 0;
   int opt;
   uint32_t debounce_t = 1;
@@ -106,26 +106,17 @@ int main(int argc, char *argv[]) {
   int verbose = 0;
 
   int inotify_fd = -1;
-  for (int i = 0; i < MAX_PATHS; i++) {
-    config.watch_paths[i] = NULL;
-    config.cached_paths[i] = NULL;
-  }
-
-  // Initialize directory watch structures
-  config.dir_watches = malloc(INITIAL_DIR_WATCHES * sizeof(dir_watch));
-  if (!config.dir_watches) {
-    fprintf(stderr, "Failed to allocate memory for directory watches\n");
+  config.roots = calloc(argc, sizeof(*config.roots));
+  if (!paths || !config.roots) {
+    fprintf(stderr, "Failed to allocate memory for the watched paths\n");
     return 1;
   }
-  config.dir_watch_count = 0;
-  config.max_dir_watches = INITIAL_DIR_WATCHES;
   config.root_count = 0;
 
   // Determine the default cache directory
   inotify_fd = inotify_init1(IN_CLOEXEC);
   if (inotify_fd == -1) {
     perror("inotify_init");
-    free(config.dir_watches);  // Clean up if initialization fails
     exit(EXIT_FAILURE);
   }
   int flags = IN_MODIFY;
@@ -138,10 +129,6 @@ int main(int argc, char *argv[]) {
   while ((opt = getopt_long(argc, argv, "d:f:t:q:c:l:vh", long_options, NULL)) != -1) {
     switch (opt) {
     case 'd':
-      if (path_count >= MAX_PATHS) {
-        fprintf(stderr, "Too many paths specified. Maximum is %d\n", MAX_PATHS);
-        exit(EXIT_FAILURE);
-      }
       paths[path_count++] = optarg;
 
       // Check if the specified path is a directory
@@ -154,10 +141,6 @@ int main(int argc, char *argv[]) {
       }
       break;
     case 'f':
-      if (path_count >= MAX_PATHS) {
-        fprintf(stderr, "Too many paths specified. Maximum is %d\n", MAX_PATHS);
-        exit(EXIT_FAILURE);
-      }
       paths[path_count++] = optarg;
 
       // Check if the specified path is a file
@@ -303,7 +286,7 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  cleanup(handle_events(inotify_fd, signal_fd, config));
+  cleanup(handle_events(inotify_fd, signal_fd, &config));
 
   return EXIT_SUCCESS;
 }

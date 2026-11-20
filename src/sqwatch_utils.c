@@ -48,6 +48,88 @@ int add_watch(int inotify_fd, const char *path, int flags) {
   return wd;
 }
 
+static size_t watch_slot(const watch_table *table, int wd) {
+  return ((unsigned)wd * 2654435761u) & (table->size - 1);
+}
+
+// The entry of watch descriptor wd, or NULL. An entry pointer is good until
+// the next watch_add() or watch_forget()
+watch_entry *watch_find(watch_table *table, int wd) {
+  if (table->size == 0 || wd < 0) {
+    return NULL;
+  }
+  for (size_t s = watch_slot(table, wd);; s = (s + 1) & (table->size - 1)) {
+    if (table->slots[s].wd == wd) {
+      return &table->slots[s];
+    }
+    if (table->slots[s].wd < 0) {
+      return NULL;
+    }
+  }
+}
+
+// The entry of wd, made empty (no path, no cache entry) if there was none.
+// NULL if wd is invalid or memory runs out
+watch_entry *watch_add(watch_table *table, int wd) {
+  watch_entry *entry = watch_find(table, wd);
+  if (entry || wd < 0) {
+    return entry;
+  }
+  if ((table->count + 1) * 4 > table->size * 3) {
+    size_t new_size = table->size ? table->size * 2 : 64;
+    watch_entry *slots = malloc(new_size * sizeof(*slots));
+    if (!slots) {
+      return NULL;
+    }
+    for (size_t s = 0; s < new_size; s++) {
+      slots[s].wd = -1;
+    }
+    watch_table grown = {slots, new_size, table->count};
+    for (size_t s = 0; s < table->size; s++) {
+      if (table->slots[s].wd >= 0) {
+        size_t t = watch_slot(&grown, table->slots[s].wd);
+        while (slots[t].wd >= 0) {
+          t = (t + 1) & (new_size - 1);
+        }
+        slots[t] = table->slots[s];
+      }
+    }
+    free(table->slots);
+    *table = grown;
+  }
+  size_t s = watch_slot(table, wd);
+  while (table->slots[s].wd >= 0) {
+    s = (s + 1) & (table->size - 1);
+  }
+  table->slots[s] = (watch_entry){wd, 0, NULL, 0, NULL};
+  table->count++;
+  return &table->slots[s];
+}
+
+// Remove the entry of wd, freeing its path and the name of its cache entry;
+// the cache entry itself is the caller's. Entries after it in its probe run
+// are moved back, so no slot is left marked deleted
+void watch_forget(watch_table *table, int wd) {
+  watch_entry *entry = watch_find(table, wd);
+  if (!entry) {
+    return;
+  }
+  free(entry->path);
+  free(entry->cached);
+  size_t mask = table->size - 1;
+  size_t hole = (size_t)(entry - table->slots);
+  for (size_t s = (hole + 1) & mask; table->slots[s].wd >= 0; s = (s + 1) & mask) {
+    size_t home = watch_slot(table, table->slots[s].wd);
+    // Move it back if its home slot is not between the hole and it
+    if (((s - home) & mask) >= ((s - hole) & mask)) {
+      table->slots[hole] = table->slots[s];
+      hole = s;
+    }
+  }
+  table->slots[hole].wd = -1;
+  table->count--;
+}
+
 void print_event_type(struct inotify_event *event) {
   // Print without newline
   switch (event->mask) {
@@ -324,14 +406,19 @@ static void watch_file(int inotify_fd, int parent_fd, const char *name, const ch
                        int root, uint32_t flags, sqwatch_config *config, int at_runtime) {
     int fd = open_file_at(parent_fd, name);
     int wd = fd == -1 ? -1 : add_watch_fd(inotify_fd, fd, flags);
-    if (wd >= 0 && wd < MAX_PATHS) {
-        config->watch_paths[wd] = strdup(path);
-        config->watch_roots[wd] = root;
-        config->path_count++;
+    watch_entry *entry = watch_add(&config->watches, wd);
+    char *copy = entry ? strdup(path) : NULL;
+    if (wd >= 0 && !copy) {
+        fprintf(stderr, RED "+ Out of memory, not watching %s\n" RESET, shown_name(path));
+    }
+    if (copy) {
+        free(entry->path);
+        entry->path = copy;
+        entry->root = root;
         if (at_runtime && config->diff_enabled && cache_dir) {
             char io_path[FD_PATH_LEN];
             create_cache_for_file(path, fd_path(fd, io_path, sizeof(io_path)), cache_dir,
-                                  &config->cached_paths[wd], config->verbose);
+                                  &entry->cached, config->verbose);
         }
         if (config->verbose) {
             printf(CYAN "+ Watch set for file %s\n" RESET, shown_name(path));
@@ -350,36 +437,17 @@ static void watch_dir(int inotify_fd, int dir_fd, const char *path, int root, ui
         return;
     }
     // A directory watched before (walked again, or reached by another name)
-    // gets the wd it already has: update its entry instead of adding one
-    for (int d = 0; d < config->dir_watch_count; d++) {
-        if (config->dir_watches[d].wd == wd) {
-            char *copy = strdup(path);
-            if (copy) {
-                free(config->dir_watches[d].path);
-                config->dir_watches[d].path = copy;
-                config->dir_watches[d].root = root;
-            }
-            if (config->verbose) {
-                printf(CYAN "+ Watch set for directory %s\n" RESET, shown_name(path));
-            }
-            return;
-        }
+    // gets the wd it already has: its entry is updated
+    watch_entry *entry = watch_add(&config->watches, wd);
+    char *copy = entry ? strdup(path) : NULL;
+    if (!copy) {
+        fprintf(stderr, RED "+ Out of memory, not watching %s\n" RESET, shown_name(path));
+        return;
     }
-    if (config->dir_watch_count >= config->max_dir_watches) {
-        int new_size = config->max_dir_watches * 2;
-        dir_watch *new_watches = realloc(config->dir_watches, new_size * sizeof(dir_watch));
-        if (!new_watches) {
-            fprintf(stderr, RED "+ Failed to allocate memory for dir watches\n" RESET);
-            return;
-        }
-        config->dir_watches = new_watches;
-        config->max_dir_watches = new_size;
-    }
-
-    config->dir_watches[config->dir_watch_count].path = strdup(path);
-    config->dir_watches[config->dir_watch_count].wd = wd;
-    config->dir_watches[config->dir_watch_count].root = root;
-    config->dir_watch_count++;
+    free(entry->path);
+    entry->path = copy;
+    entry->root = root;
+    entry->is_dir = 1;
 
     if (config->verbose) {
         printf(CYAN "+ Watch set for directory %s\n" RESET, shown_name(path));
@@ -567,8 +635,7 @@ static int climb(int child_fd, const watch_root *top, char *path, walk_level *le
 // directory, for everything below it. path is the entry's displayed path.
 // The walk is depth first. The files of a directory are watched while it is
 // read, before any of its subdirectories is entered; the recursive walk of
-// v0.4.1 took files and subdirectories in readdir order instead, so under the
-// MAX_PATHS limit on watch descriptors the files that fit can differ from it.
+// v0.4.1 took files and subdirectories in readdir order instead.
 // It holds one descriptor, of the directory it is in, and keeps the names of
 // the subdirectories still to walk of each directory on the way down on the
 // heap: there is no recursion and no descriptor held per level, however deep
@@ -691,10 +758,6 @@ void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags,
         fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, shown_name(path), strerror(errno));
         return;
     }
-    if (config->root_count >= MAX_PATHS) {
-        return;
-    }
-
     watch_root *root = &config->roots[config->root_count];
     const char *name = ".";
     root->path = NULL;
@@ -750,45 +813,71 @@ void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags,
     add_watches_walk(inotify_fd, root->fd, name, path, config->root_count - 1, flags, config, 0);
 }
 
+static int compare_ints(const void *a, const void *b) {
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+// The watch descriptors of every file watch, in increasing order, in an array
+// to free; *count is set to their number. NULL if there are none or memory
+// runs out
+static int *file_watch_list(const watch_table *table, size_t *count) {
+    int *wds = table->count ? malloc(table->count * sizeof(*wds)) : NULL;
+    *count = 0;
+    if (!wds) {
+        return NULL;
+    }
+    for (size_t s = 0; s < table->size; s++) {
+        if (table->slots[s].wd >= 0 && !table->slots[s].is_dir) {
+            wds[(*count)++] = table->slots[s].wd;
+        }
+    }
+    qsort(wds, *count, sizeof(*wds), compare_ints);
+    return wds;
+}
+
 // Copy every watched file into the cache at startup, overwriting what is
 // there. Each file is opened beneath its root and read through that descriptor
 void cache_watched_files(sqwatch_config *config) {
-    for (int i = 0; i < MAX_PATHS; i++) {
-        if (config->watch_paths[i] == NULL) {
-            continue;
-        }
+    size_t count;
+    int *wds = file_watch_list(&config->watches, &count);
+    if (!wds && config->watches.count) {
+        fprintf(stderr, RED "+ Out of memory, not caching the watched files\n" RESET);
+    }
+    for (size_t n = 0; n < count; n++) {
         stop_if_signalled();
+        watch_entry *entry = watch_find(&config->watches, wds[n]);
 
-        const watch_root *root = &config->roots[config->watch_roots[i]];
+        const watch_root *root = &config->roots[entry->root];
         struct stat st;
-        int fd = open_beneath(root->fd, rel_path(root, config->watch_paths[i]), O_PATH);
+        int fd = open_beneath(root->fd, rel_path(root, entry->path), O_PATH);
         if (fd == -1) {
             fprintf(stderr, RED "+ Not caching %s: %s\n" RESET,
-                    shown_name(config->watch_paths[i]), strerror(errno));
+                    shown_name(entry->path), strerror(errno));
             continue;
         }
         if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
             fprintf(stderr, RED "+ Not caching %s: no longer a regular file\n" RESET,
-                    shown_name(config->watch_paths[i]));
+                    shown_name(entry->path));
             close(fd);
             continue;
         }
 
         // Every file gets an entry of its own, written now
         char io_path[FD_PATH_LEN];
-        if (config->cached_paths[i]) {
-            unlink_cache_file(config->cached_paths[i]);
-            free(config->cached_paths[i]);
+        if (entry->cached) {
+            unlink_cache_file(entry->cached);
+            free(entry->cached);
         }
-        config->cached_paths[i] = cache_new_entry(cache_dir);
-        if (config->cached_paths[i] &&
-            copy_file(fd_path(fd, io_path, sizeof(io_path)), config->cached_paths[i],
-                      config->watch_paths[i]) == 0 && config->verbose) {
-            printf(DARK_GREY "+ Cached [%d]: %s\n" RESET, i,
-                   shown_name(config->watch_paths[i]));
+        entry->cached = cache_new_entry(cache_dir);
+        if (entry->cached &&
+            copy_file(fd_path(fd, io_path, sizeof(io_path)), entry->cached, entry->path) == 0 &&
+            config->verbose) {
+            printf(DARK_GREY "+ Cached [%d]: %s\n" RESET, wds[n], shown_name(entry->path));
         }
         close(fd);
     }
+    free(wds);
 }
 
 
@@ -860,7 +949,7 @@ static void start_command(const char *command) {
 
 // Handle inotify events until SIGINT or SIGTERM is read from signal_fd, and
 // return that signal
-int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
+int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
     char buffer[BUF_LEN];
     time_t last_event = 0;
     time_t last_create = 0;
@@ -912,19 +1001,14 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
             }
 
             // Check if this is a directory watch event
-            int is_dir_watch = 0;
-            char *dir_path = NULL;
-            int dir_root = 0;
-            for (int d = 0; d < config.dir_watch_count; d++) {
-                if (config.dir_watches[d].wd == event->wd) {
-                    is_dir_watch = 1;
-                    dir_path = config.dir_watches[d].path;
-                    dir_root = config.dir_watches[d].root;
-                    break;
-                }
-            }
+            watch_entry *watched = watch_find(&config->watches, event->wd);
+            int is_dir_watch = watched && watched->is_dir;
 
             if (is_dir_watch && (event->mask & IN_CREATE)) {
+                // The entry may move as watches are added below
+                char dir_path[PATH_MAX];
+                int dir_root = watched->root;
+                snprintf(dir_path, sizeof(dir_path), "%s", watched->path);
                 char full_path[PATH_MAX];
                 if (snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, event->name) >= (int)sizeof(full_path)) {
                     fprintf(stderr, RED "+ Path too long, skipping event\n" RESET);
@@ -934,12 +1018,12 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
 
                 // Reach the directory from its root without following symlinks
                 // and look at the new entry relative to that descriptor
-                const watch_root *root = &config.roots[dir_root];
+                const watch_root *root = &config->roots[dir_root];
                 int dir_fd = open_beneath(root->fd, rel_path(root, dir_path), O_PATH | O_DIRECTORY);
                 struct stat path_stat;
                 if (dir_fd != -1 && fstatat(dir_fd, event->name, &path_stat, AT_SYMLINK_NOFOLLOW) == 0) {
                     if (S_ISLNK(path_stat.st_mode)) {
-                        if (config.verbose) {
+                        if (config->verbose) {
                             printf(DARK_GREY "+ Skipping symlink %s\n" RESET, shown_name(full_path));
                         }
                     } else if (S_ISREG(path_stat.st_mode)) {
@@ -947,22 +1031,26 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                         char io_path[FD_PATH_LEN];
                         int file_fd = open_file_at(dir_fd, event->name);
                         int new_wd = file_fd == -1 ? -1 :
-                            add_watch(inotify_fd, fd_path(file_fd, io_path, sizeof(io_path)), config.flags);
-                        if (new_wd >= 0 && new_wd < MAX_PATHS) {
+                            add_watch(inotify_fd, fd_path(file_fd, io_path, sizeof(io_path)), config->flags);
+                        watch_entry *added = watch_add(&config->watches, new_wd);
+                        char *copy = added ? strdup(full_path) : NULL;
+                        if (new_wd >= 0 && !copy) {
+                            fprintf(stderr, RED "+ Out of memory, not watching %s\n" RESET,
+                                    shown_name(full_path));
+                        }
+                        if (copy) {
                             // Free any existing path at this watch descriptor
-                            if (config.watch_paths[new_wd]) {
-                                free(config.watch_paths[new_wd]);
-                            }
-                            config.watch_paths[new_wd] = strdup(full_path);
-                            config.watch_roots[new_wd] = dir_root;
+                            free(added->path);
+                            added->path = copy;
+                            added->root = dir_root;
 
                             // A file watched already (another name for it) keeps
                             // its cache entry; create_cache_for_file() rewrites it
-                            if (config.diff_enabled && cache_dir) {
-                                create_cache_for_file(full_path, io_path, cache_dir, &config.cached_paths[new_wd], config.verbose);
+                            if (config->diff_enabled && cache_dir) {
+                                create_cache_for_file(full_path, io_path, cache_dir, &added->cached, config->verbose);
                             }
 
-                            if (config.verbose) {
+                            if (config->verbose) {
                                 printf(CYAN "+ Added watch for new file: %s\n" RESET, shown_name(full_path));
                             }
                         }
@@ -971,33 +1059,34 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                         }
                     } else if (S_ISDIR(path_stat.st_mode)) {
                         // New directory created - add recursive watches
-                        add_watches_walk(inotify_fd, dir_fd, event->name, full_path, dir_root, config.flags, &config, 1);
+                        add_watches_walk(inotify_fd, dir_fd, event->name, full_path, dir_root, config->flags, config, 1);
                     }
 
                     // Directory watches always carry IN_CREATE to pick up new
                     // files; only run the command if create was requested.
                     // Creates are debounced on their own so they cannot
                     // swallow a write to the new file that follows
-                    if ((config.flags & IN_CREATE) && now - last_create >= config.debounce_t) {
+                    if ((config->flags & IN_CREATE) && now - last_create >= config->debounce_t) {
                         stop_command();
                         printf(CYAN "+ Trigger on %s: [ Created ]\n" RESET,
                             shown_name(full_path));
-                        start_command(config.command);
+                        start_command(config->command);
                         last_create = now;
                     }
                 }
                 if (dir_fd != -1) {
                     close(dir_fd);
                 }
-            } else if (!is_dir_watch && event->wd < MAX_PATHS && config.watch_paths[event->wd]) {
+            } else if (!is_dir_watch && watched && watched->path) {
                 char full_path[PATH_MAX];
                 int watch_updated = 0;
                 int event_wd = event->wd;
+                int event_root = watched->root;
                 int plen;
                 if (event->len > 0) {
-                    plen = snprintf(full_path, sizeof(full_path), "%s/%s", config.watch_paths[event_wd], event->name);
+                    plen = snprintf(full_path, sizeof(full_path), "%s/%s", watched->path, event->name);
                 } else {
-                    plen = snprintf(full_path, sizeof(full_path), "%s", config.watch_paths[event_wd]);
+                    plen = snprintf(full_path, sizeof(full_path), "%s", watched->path);
                 }
 
                 if (plen < 0 || (size_t)plen >= sizeof(full_path)) {
@@ -1009,7 +1098,7 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                 // Check if file still exists for any event. It is opened once,
                 // without following symlinks, and everything below acts on
                 // this descriptor instead of resolving the path again
-                watch_root *root = &config.roots[config.watch_roots[event_wd]];
+                watch_root *root = &config->roots[event_root];
                 int file_fd = open_beneath(root->fd, rel_path(root, full_path), O_PATH);
                 // A -f file may be gone because its directory was replaced:
                 // look for it once more in what its directory path names now
@@ -1026,7 +1115,7 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                     if (file_fd != -1) {
                         close(file_fd);
                     }
-                    if (config.verbose) {
+                    if (config->verbose) {
                         printf(DARK_GREY "+ File no longer exists: %s\n" RESET, shown_name(full_path));
                     }
                     // Release the kernel watch too, or it stays for as long as
@@ -1034,19 +1123,15 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                     if (!(event->mask & IN_IGNORED)) {
                         inotify_rm_watch(inotify_fd, event->wd);
                     }
-                    // Clean up watch path
-                    free(config.watch_paths[event->wd]);
-                    config.watch_paths[event->wd] = NULL;
-
                     // Clean up cache path
-                    if (config.cached_paths[event->wd]) {
-                        if (config.verbose) {
+                    if (watched->cached) {
+                        if (config->verbose) {
                             printf(DARK_GREY "+ Removing cache for: %s\n" RESET, shown_name(full_path));
                         }
-                        unlink_cache_file(config.cached_paths[event->wd]); // Remove cache file
-                        free(config.cached_paths[event->wd]);
-                        config.cached_paths[event->wd] = NULL;
+                        unlink_cache_file(watched->cached); // Remove cache file
                     }
+                    // Clean up the watch entry
+                    watch_forget(&config->watches, event->wd);
                     i += EVENT_SIZE + event->len;
                     continue;
                 }
@@ -1057,37 +1142,39 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                 // We need to reapply the watch to the file in case the file was not deleted.
                 if (event->mask & IN_IGNORED) {
                     watch_updated = 1;
-                    int new_wd = add_watch(inotify_fd, io_path, config.flags);
+                    int new_wd = add_watch(inotify_fd, io_path, config->flags);
+                    char *copy = new_wd >= 0 ? strdup(full_path) : NULL;
+                    watch_entry *rewatched = copy ? watch_add(&config->watches, new_wd) : NULL;
 
-                    if (new_wd >= 0 && new_wd < MAX_PATHS) {
+                    if (new_wd >= 0 && !rewatched) {
+                        fprintf(stderr, RED "+ Out of memory tracking %s\n" RESET, shown_name(full_path));
+                        free(copy);
+                        close(file_fd);
+                        i += EVENT_SIZE + event->len;
+                        continue;
+                    }
+                    if (rewatched) {
                         // Free old path if it exists at new_wd
-                        if (config.watch_paths[new_wd]) {
-                            free(config.watch_paths[new_wd]);
-                        }
-                        config.watch_paths[new_wd] = strdup(full_path);
-                        if (!config.watch_paths[new_wd]) {
-                            fprintf(stderr, RED "+ Out of memory tracking %s\n" RESET, shown_name(full_path));
-                            close(file_fd);
-                            i += EVENT_SIZE + event->len;
-                            continue;
-                        }
-                        config.watch_roots[new_wd] = config.watch_roots[event_wd];
+                        free(rewatched->path);
+                        rewatched->path = copy;
+                        rewatched->root = event_root;
                         if (event_wd != new_wd) {
                             // The old watch is gone. new_wd may already have
                             // watched this file under another name (a temporary
                             // file renamed over it): drop that name's cache
-                            free(config.watch_paths[event_wd]);
-                            config.watch_paths[event_wd] = NULL;
-                            if (config.cached_paths[new_wd] && (!config.cached_paths[event_wd] ||
-                                strcmp(config.cached_paths[new_wd], config.cached_paths[event_wd]) != 0)) {
-                                unlink_cache_file(config.cached_paths[new_wd]);
+                            watch_entry *old = watch_find(&config->watches, event_wd);
+                            if (rewatched->cached && (!old->cached ||
+                                strcmp(rewatched->cached, old->cached) != 0)) {
+                                unlink_cache_file(rewatched->cached);
                             }
-                            free(config.cached_paths[new_wd]);
-                            config.cached_paths[new_wd] = config.cached_paths[event_wd];
-                            config.cached_paths[event_wd] = NULL;
+                            free(rewatched->cached);
+                            rewatched->cached = old->cached;
+                            old->cached = NULL;
+                            watch_forget(&config->watches, event_wd);
+                            rewatched = watch_find(&config->watches, new_wd);
                         }
 
-                        if (config.verbose) {
+                        if (config->verbose) {
                             printf(DARK_GREY "+ Reapplied watch for %s\n" RESET, shown_name(full_path));
                         }
                         event_wd = new_wd;
@@ -1112,18 +1199,19 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                     event->mask & IN_Q_OVERFLOW ? "Queue overflow" :
                     event->mask & IN_IGNORED ? "Watch removed" : "Unknown");
 
-                if (now - last_event >= config.debounce_t || watch_updated) {
+                if (now - last_event >= config->debounce_t || watch_updated) {
                     stop_command();
 
                     if (!(event->mask & IN_IGNORED)) {
                         printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET,
-                            shown_name(config.watch_paths[event_wd]),
+                            shown_name(full_path),
                             event_desc);
                     }
 
-                    start_command(config.command);
+                    start_command(config->command);
 
-                    if (cache_dir && config.diff_enabled) {
+                    watch_entry *current = watch_find(&config->watches, event_wd);
+                    if (cache_dir && config->diff_enabled && current) {
                         if (event->mask & (IN_MODIFY | IN_IGNORED)) {
                             char event_desc[256];
                             snprintf(event_desc, sizeof(event_desc), "Modified");
@@ -1131,16 +1219,16 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                             stop_if_signalled();
                             // A file without an entry (its copy failed) gets
                             // one now; run_diff() then reports it as new
-                            if (!config.cached_paths[event_wd]) {
-                                config.cached_paths[event_wd] = cache_new_entry(cache_dir);
+                            if (!current->cached) {
+                                current->cached = cache_new_entry(cache_dir);
                             }
-                            if (config.cached_paths[event_wd]) {
-                                run_diff(config.watch_paths[event_wd],
+                            if (current->cached) {
+                                run_diff(current->path,
                                     io_path,
-                                    config.cached_paths[event_wd],
+                                    current->cached,
                                     event_desc,
                                     1, // diff is always verbose
-                                    config.log_file);
+                                    config->log_file);
                             }
                         }
 
