@@ -205,9 +205,11 @@ static int reopen_file_root(watch_root *root) {
 // Add watches for the entry `name` of the directory parent_fd and, if it is a
 // directory, for everything below it. path is the entry's displayed path.
 // Entries are only ever reached relative to a descriptor and symlinks are not
-// followed, so the walk cannot leave the tree it started in
+// followed, so the walk cannot leave the tree it started in. at_runtime is set
+// for a directory that appeared after startup: its files are cached here, as
+// cache_watched_files() only covers the startup walk
 static void add_watches_walk(int inotify_fd, int parent_fd, const char *name, const char *path,
-                             int root, uint32_t flags, sqwatch_config *config) {
+                             int root, uint32_t flags, sqwatch_config *config, int at_runtime) {
     struct stat path_stat;
     if (fstatat(parent_fd, name, &path_stat, AT_SYMLINK_NOFOLLOW) == -1) {
         fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, path, strerror(errno));
@@ -277,7 +279,8 @@ static void add_watches_walk(int inotify_fd, int parent_fd, const char *name, co
                         path, entry->d_name);
                 continue;
             }
-            add_watches_walk(inotify_fd, dir_fd, entry->d_name, full_path, root, flags, config);
+            add_watches_walk(inotify_fd, dir_fd, entry->d_name, full_path, root, flags, config,
+                             at_runtime);
         }
         closedir(dir);
     } else if (S_ISREG(path_stat.st_mode)) {
@@ -288,6 +291,13 @@ static void add_watches_walk(int inotify_fd, int parent_fd, const char *name, co
             config->watch_paths[wd] = strdup(path);
             config->watch_roots[wd] = root;
             config->path_count++;
+            if (at_runtime && config->diff_enabled && cache_dir) {
+                char io_path[FD_PATH_LEN];
+                free(config->cached_paths[wd]);
+                config->cached_paths[wd] = NULL;
+                create_cache_for_file(path, fd_path(fd, io_path, sizeof(io_path)), cache_dir,
+                                      &config->cached_paths[wd], config->verbose);
+            }
             if (config->verbose) {
                 printf(CYAN "+ Watch set for file %s\n" RESET, path);
             }
@@ -365,7 +375,7 @@ void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags,
     }
 
     config->root_count++;
-    add_watches_walk(inotify_fd, root->fd, name, path, config->root_count - 1, flags, config);
+    add_watches_walk(inotify_fd, root->fd, name, path, config->root_count - 1, flags, config, 0);
 }
 
 // Copy every watched file into the cache at startup, overwriting what is
@@ -566,7 +576,7 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                         }
                     } else if (S_ISDIR(path_stat.st_mode)) {
                         // New directory created - add recursive watches
-                        add_watches_walk(inotify_fd, dir_fd, event->name, full_path, dir_root, config.flags, &config);
+                        add_watches_walk(inotify_fd, dir_fd, event->name, full_path, dir_root, config.flags, &config, 1);
                     }
 
                     // Directory watches always carry IN_CREATE to pick up new
