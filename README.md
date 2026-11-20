@@ -77,6 +77,11 @@ Watch:
 
 Command:
 - `-c COMMAND`: Run COMMAND with `/bin/sh -c` on each change; a run still going is stopped and started again
+- The command gets the change that started it in its environment, never in the command string:
+  - `SQWATCH_PATH`: the path of the file or directory, as sqwatch shows it (relative to the `-d` or `-f` path given), byte for byte
+  - `SQWATCH_EVENT`: `modify`, `create`, `delete`, `move` or `attrib`; `overflow`, with an empty `SQWATCH_PATH`, when events were lost and the tree was walked again without `--diff`
+
+  Quote them: `sqwatch -d src -c 'echo "changed: $SQWATCH_PATH ($SQWATCH_EVENT)"'`. When changes come together (in one batch of events, or inside the debounce window of the last run), they lead to one run, and that run gets the latest of them.
 - `-t SECONDS`: Debounce time of each file, a decimal number of seconds such as `2` or `0.25`, from 0 to 86400 (default: 1)
 
 Diff:

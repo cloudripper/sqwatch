@@ -1268,8 +1268,10 @@ static void stop_command(void) {
     }
 }
 
-// Run the user's command in its own process group without waiting for it
-static void start_command(const char *command) {
+// Run the user's command in its own process group without waiting for it.
+// The change that started it is in its environment, never in the command
+// string: SQWATCH_PATH, the path as it is, and SQWATCH_EVENT
+static void start_command(const char *command, const char *path, const char *event) {
     if (command != NULL) {
         // Hold SIGTERM/SIGINT/SIGHUP across fork. sqwatch keeps them blocked
         // and reads them from a signalfd; the child must get them as usual,
@@ -1301,6 +1303,8 @@ static void start_command(const char *command) {
             setpgid(0, 0);  // Create new process group
             setvbuf(stdout, NULL, _IONBF, 0);
             setvbuf(stderr, NULL, _IONBF, 0);
+            setenv("SQWATCH_PATH", path ? path : "", 1);
+            setenv("SQWATCH_EVENT", event ? event : "", 1);
             char *const args[] = {"/bin/sh", "-c", (char *)command, NULL};
             execve("/bin/sh", args, environ);
             perror("execve");
@@ -1325,6 +1329,8 @@ typedef struct {
     long long command_run;   // When the command was last started; 0 if never
     int command_wanted;      // A run was asked for while handling events
     int command_due;         // A run is to be made when the window closes
+    char *command_path;      // The latest change a run was asked for: what
+    const char *command_event;  // the run gets as SQWATCH_PATH and _EVENT
 } event_loop;
 
 static long long now_ms(void) {
@@ -1333,10 +1339,17 @@ static long long now_ms(void) {
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000 + 1;
 }
 
-// Ask for the command to be started again for a change. The requests made
-// while a buffer of events is handled come to one run, made by
-// flush_command() once the buffer is done
-static void run_command(event_loop *loop) {
+// Ask for the command to be started again for a change to path, event (see
+// event_name()). The requests made while a buffer of events is handled come
+// to one run, made by flush_command() once the buffer is done; the run gets
+// the latest of them
+static void run_command(event_loop *loop, const char *path, const char *event) {
+    char *copy = strdup(path);
+    if (copy) {
+        free(loop->command_path);
+        loop->command_path = copy;
+        loop->command_event = event;
+    }
     loop->command_wanted = 1;
 }
 
@@ -1352,9 +1365,20 @@ static void flush_command(event_loop *loop) {
         return;
     }
     stop_command();
-    start_command(loop->config->command);
+    start_command(loop->config->command, loop->command_path, loop->command_event);
     loop->command_run = loop->now;
     loop->command_due = 0;
+}
+
+// The name of an event, as the command gets it in SQWATCH_EVENT
+static const char *event_name(uint32_t mask) {
+    return mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_IGNORED) ? "modify" :
+           mask & IN_CREATE ? "create" :
+           mask & IN_DELETE ? "delete" :
+           mask & IN_MOVE ? "move" :
+           mask & IN_ATTRIB ? "attrib" :
+           mask & IN_OPEN ? "open" :
+           mask & IN_ACCESS ? "access" : "other";
 }
 
 static const char *describe(uint32_t mask) {
@@ -1420,7 +1444,7 @@ static void fire_file(event_loop *loop, int wd, const char *path, const char *io
     if (!quiet || (mask & ~IN_IGNORED)) {
         printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET, shown_name(path), describe(mask));
     }
-    run_command(loop);
+    run_command(loop, path, event_name(mask));
 
     if (cache_dir && config->diff_enabled && (mask & (IN_MODIFY | IN_IGNORED))) {
         stop_if_signalled();
@@ -1678,7 +1702,7 @@ static void on_dir_event(event_loop *loop, int wd, const struct inotify_event *e
     // is shown; command runs are coalesced (see run_command())
     if (asked && exists) {
         printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET, shown_name(full_path), describe(asked));
-        run_command(loop);
+        run_command(loop, full_path, event_name(asked));
     }
 }
 
@@ -1728,7 +1752,7 @@ static void rescan(event_loop *loop) {
     free(stale);
 
     if (!config->diff_enabled || !cache_dir) {
-        run_command(loop);
+        run_command(loop, "", "overflow");
         return;
     }
     size_t files;
@@ -1788,7 +1812,7 @@ static void diff_changed(event_loop *loop) {
 // signal_fd, and return that signal; SIGTERM if the events cannot be read
 int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
     char buffer[BUF_LEN];
-    event_loop loop = {inotify_fd, config, 0, config->debounce_ms, 0, 0, 0};
+    event_loop loop = {inotify_fd, config, 0, config->debounce_ms, 0, 0, 0, NULL, NULL};
 
     while (1) {
         // stdout is polled for an error only: its reader went away
@@ -1878,6 +1902,11 @@ void print_usage(void) {
            "  -c COMMAND     Run COMMAND with /bin/sh -c on each change; a run still going\n"
            "                 is stopped and started again\n"
            "  -t SECONDS     Debounce time of each file, a decimal number (default: 1)\n"
+           "                 The command gets the change in its environment: SQWATCH_PATH,\n"
+           "                 the path, and SQWATCH_EVENT: modify, create, delete, move,\n"
+           "                 attrib (overflow, with an empty path, after lost events).\n"
+           "                 Use them quoted, as \"$SQWATCH_PATH\". When changes come\n"
+           "                 together, one run is made, for the latest of them\n"
            "\n"
            "Diff:\n"
            "  --diff         Show what changed in each file, from a private cache\n"
