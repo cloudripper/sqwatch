@@ -22,6 +22,7 @@ int open_cache_file(const char *path, int flags);
 int open_watched_file(const char *io_path);
 int copy_file(const char *src, const char *dest, const char *shown_path);
 char *cache_new_entry(const char *cache_dir);
+char *cache_copy_entry(const char *cache_dir, const char *src);
 int unlink_cache_file(const char *path);
 int cache_differs(const char *io_path, const char *path);
 int cache_stub(const char *path, off_t *size, struct timespec *mtime);

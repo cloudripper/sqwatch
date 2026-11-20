@@ -33,85 +33,92 @@ typedef struct {
     char *shown;             // The path as given: the displayed path of the root
 } watch_root;
 
-// A displayed path a watch is reached by. A file has one for each of its
-// names (hard links) in the watched trees; a directory has one
-typedef struct {
-    char *path;
-    int root;                // Index into roots
-    unsigned seen;           // The last rescan that found it
-} watch_name;
+typedef struct dir_entry dir_entry;
+typedef struct file_entry file_entry;
+typedef struct inode_node inode_node;
 
-// A watched file or directory, by its watch descriptor
-typedef struct {
-    int wd;                  // -1 marks a free slot
-    int is_dir;
-    dev_t dev;               // The inode watched
+// A file's content, as an inode: the cache entry of what it held when last
+// seen, shared by all the watched names of the inode (hard links)
+struct inode_node {
+    dev_t dev;
     ino_t ino;
-    watch_name *names;
-    int name_count;
-    char *cached;            // A file's cache entry, or NULL
+    char *cached;            // Its cache entry, or NULL
+    file_entry **names;
+    size_t count, size;
+    inode_node *next;        // Chain of the inode table
+};
+
+// A watched directory, by its watch descriptor. Its watch also reports what
+// happens to the files in it, by name: files get no watch of their own
+struct dir_entry {
+    int wd;
+    char *path;              // Displayed path
+    char *name;              // Name in its parent; NULL for a -d or -f root
+    int root;                // Index into roots
+    int full;                // Walked: every entry in it counts. Otherwise it
+                             // is the directory of -f files only (see only)
+    char **only;             // -f: the names in it that are watched
+    int only_count;
+    dev_t dev;
+    ino_t ino;
+    dir_entry *parent;
+    size_t parent_at;        // Its index in parent->subdirs
+    dir_entry **subdirs;
+    size_t subdir_count, subdir_size;
+    file_entry **files;
+    size_t file_count, file_size;
+    unsigned seen;           // The last rescan that found it
+    dir_entry *next;         // Chains of the wd table and the name table
+    dir_entry *name_next;
+};
+
+// A watched file: a name in a watched directory. Each name of a file with
+// hard links is a file of its own
+struct file_entry {
+    dir_entry *dir;
+    char *name;
+    int root;                // Index into roots (a -f file has its own)
+    size_t dir_at;           // Its index in dir->files
+    inode_node *inode;       // What it named when last seen
+    size_t inode_at;         // Its index in inode->names
     unsigned char changed;   // In the changed list: why (CHANGED_*)
+    unsigned char fresh;     // Created at runtime, not written since
+    size_t changed_at;
     long long last_fire;     // When its last change was handled, in ms of
                              // CLOCK_MONOTONIC; 0 if never
     uint32_t pending;        // Events deferred to the end of its debounce
-                             // window; non-zero while in the pending list
+    size_t pending_at;       // window; non-zero while in the pending list
     struct timespec fired_ctime;  // Its status change time and size when its
     off_t fired_size;             // last change was handled
-} watch_entry;
+    unsigned seen;           // The last rescan that found it
+    file_entry *next;        // Chain of the name table
+};
 
 #define CHANGED_TAKEOVER 1   // Took over the cache entry of a name it replaced
 #define CHANGED_CREATED 2    // The same, when it was created under the name
 #define CHANGED_RESCAN 3     // Found to differ from its cache entry in a rescan
 
-// Every watch, keyed by watch descriptor: open addressing with linear
-// probing. The kernel hands out new descriptors as watches come and go, so
-// there is no upper bound on their values and no limit on their number here
+// A hash table with chains; what the chains link depends on the table
 typedef struct {
-    watch_entry *slots;
-    size_t size;             // Number of slots: 0 or a power of two
-    size_t count;            // Slots in use
-} watch_table;
-
-// Every watched name, to its watch descriptor: open addressing with linear
-// probing, keyed by the displayed path. The path strings are the watch_name's
-typedef struct {
-    const char *path;        // NULL marks a free slot
-    size_t hash;
-    int wd;
-} name_slot;
-
-typedef struct {
-    name_slot *slots;
-    size_t size;
+    void **buckets;
+    size_t size;             // 0 or a power of two
     size_t count;
-} name_index;
-
-// Every watched inode, to its watch descriptor: open addressing with linear
-// probing (for -p, which is told about a file by its inode)
-typedef struct {
-    dev_t dev;
-    ino_t ino;
-    int wd;                  // -1 marks a free slot
-} inode_slot;
+} chain_table;
 
 typedef struct {
-    inode_slot *slots;
-    size_t size;
-    size_t count;
-} inode_index;
-
-typedef struct {
-    watch_table watches;
-    inode_index inodes;
+    chain_table dirs;        // dir_entry by wd
+    chain_table dir_names;   // dir_entry by parent wd and name
+    chain_table files;       // file_entry by directory wd and name
+    chain_table inodes;      // inode_node by dev and ino
     int perm;                // -p: the command decides opens, nothing else
     int inotify_fd;
-    name_index names;
     unsigned scan;           // Rescans so far
     int creating;            // Watching an entry an IN_CREATE event named
-    int *changed;            // Files to diff against their cache entry, as
+    int watch_failed;        // Watches that could not be set: coverage is not whole
+    file_entry **changed;    // Files to diff against their cache entry, as
     size_t changed_count;    // they may have changed without an event of
     size_t changed_size;     // their own (see mark_changed())
-    int *pending;            // Files with events deferred by the debounce
+    file_entry **pending;    // Files with events deferred by the debounce
     size_t pending_count;
     size_t pending_size;
     char **ignores;          // -i patterns
@@ -129,8 +136,9 @@ typedef struct {
 } sqwatch_config;
 
 // What a directory watch gets beyond the events asked for, to follow the
-// entries that come into the tree or leave it
-#define DIR_WATCH_EVENTS (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO)
+// entries that come into the tree or leave it, and to see its own end
+#define DIR_WATCH_EVENTS (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | \
+                          IN_DELETE_SELF | IN_MOVE_SELF)
 
 
 
@@ -140,8 +148,6 @@ void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags, sqw
 void cache_watched_files(sqwatch_config *config);
 int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config);
 void print_usage(void);
-watch_entry *watch_find(watch_table *table, int wd);
-watch_entry *watch_add(watch_table *table, int wd);
 const char *watched_path(dev_t dev, ino_t ino);
 void stop_if_signalled(void);
 void stop_if_output_closed(void);

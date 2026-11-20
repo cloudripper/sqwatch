@@ -50,83 +50,6 @@ int add_watch(int inotify_fd, const char *path, int flags) {
   return wd;
 }
 
-static size_t watch_slot(const watch_table *table, int wd) {
-  return ((unsigned)wd * 2654435761u) & (table->size - 1);
-}
-
-// The entry of watch descriptor wd, or NULL. An entry pointer is good until
-// the next watch is added or dropped
-watch_entry *watch_find(watch_table *table, int wd) {
-  if (table->size == 0 || wd < 0) {
-    return NULL;
-  }
-  for (size_t s = watch_slot(table, wd);; s = (s + 1) & (table->size - 1)) {
-    if (table->slots[s].wd == wd) {
-      return &table->slots[s];
-    }
-    if (table->slots[s].wd < 0) {
-      return NULL;
-    }
-  }
-}
-
-// The entry of wd, made empty (no names, no cache entry) if there was none.
-// NULL if wd is invalid or memory runs out
-watch_entry *watch_add(watch_table *table, int wd) {
-  watch_entry *entry = watch_find(table, wd);
-  if (entry || wd < 0) {
-    return entry;
-  }
-  if ((table->count + 1) * 4 > table->size * 3) {
-    size_t new_size = table->size ? table->size * 2 : 64;
-    watch_entry *slots = malloc(new_size * sizeof(*slots));
-    if (!slots) {
-      return NULL;
-    }
-    for (size_t s = 0; s < new_size; s++) {
-      slots[s].wd = -1;
-    }
-    watch_table grown = {slots, new_size, table->count};
-    for (size_t s = 0; s < table->size; s++) {
-      if (table->slots[s].wd >= 0) {
-        size_t t = watch_slot(&grown, table->slots[s].wd);
-        while (slots[t].wd >= 0) {
-          t = (t + 1) & (new_size - 1);
-        }
-        slots[t] = table->slots[s];
-      }
-    }
-    free(table->slots);
-    *table = grown;
-  }
-  size_t s = watch_slot(table, wd);
-  while (table->slots[s].wd >= 0) {
-    s = (s + 1) & (table->size - 1);
-  }
-  table->slots[s] = (watch_entry){.wd = wd};
-  table->count++;
-  return &table->slots[s];
-}
-
-// Free the slot of entry, which has no names left. Entries after it in its
-// probe run are moved back, so no slot is left marked deleted
-static void watch_remove(watch_table *table, watch_entry *entry) {
-  size_t mask = table->size - 1;
-  size_t hole = (size_t)(entry - table->slots);
-  free(entry->names);
-  free(entry->cached);
-  for (size_t s = (hole + 1) & mask; table->slots[s].wd >= 0; s = (s + 1) & mask) {
-    size_t home = watch_slot(table, table->slots[s].wd);
-    // Move it back if its home slot is not between the hole and it
-    if (((s - home) & mask) >= ((s - hole) & mask)) {
-      table->slots[hole] = table->slots[s];
-      hole = s;
-    }
-  }
-  table->slots[hole].wd = -1;
-  table->count--;
-}
-
 void print_event_type(struct inotify_event *event) {
   // Print without newline
   switch (event->mask) {
@@ -290,37 +213,17 @@ static const char *fd_path(int fd, char *buf, size_t size) {
     return buf;
 }
 
-// The events a file watch carries: those asked for, and with open or access
-// both close events, so that two opens or reads in a row are never merged
-// into one by the kernel (it merges an event with the same one queued just
-// before it)
-static uint32_t file_watch_mask(uint32_t flags) {
-    if (!flags) {
-        return IN_DELETE_SELF | IN_MOVE_SELF;  // -p alone: the file is only followed
-    }
-    return flags | (flags & (IN_OPEN | IN_ACCESS) ? IN_CLOSE_WRITE | IN_CLOSE_NOWRITE : 0);
-}
-
-// The events a directory watch carries: none about reads (an open in a
-// directory is reported by the file's own watch), and DIR_WATCH_EVENTS
+// The events a directory watch carries. Its own watch reports, by name, what
+// happens to the files in it: the events asked for, DIR_WATCH_EVENTS to follow
+// the tree, and with open or access both close events, so that two opens or
+// reads in a row are never merged into one by the kernel (it merges an event
+// with the same one queued just before it). Files have no watch of their own
 static uint32_t dir_watch_mask(uint32_t flags) {
-    return (flags & ~(IN_OPEN | IN_ACCESS | IN_CLOSE_NOWRITE)) | DIR_WATCH_EVENTS;
+    return flags | DIR_WATCH_EVENTS |
+           (flags & (IN_OPEN | IN_ACCESS) ? IN_CLOSE_WRITE | IN_CLOSE_NOWRITE : 0);
 }
 
 #define READ_EVENTS (IN_OPEN | IN_ACCESS | IN_CLOSE_NOWRITE)
-
-// sqwatch's own reads of a watched file (its copies, diffs and checks) must
-// not show up as opens or accesses. With -q open or -q access, the watch of
-// the file read through io_path, which must exist, drops the read events
-// (quiet set) before such a read and gets them back after it. The kernel then
-// queues no event for these reads at all; the price is that another process
-// reading the same file in that moment is not seen either
-static void own_reads(const sqwatch_config *config, const char *io_path, int quiet) {
-    if (config->flags & (IN_OPEN | IN_ACCESS)) {
-        uint32_t mask = file_watch_mask(config->flags);
-        inotify_add_watch(config->inotify_fd, io_path, quiet ? mask & ~READ_EVENTS : mask);
-    }
-}
 
 // Watch exactly the inode fd refers to. The /proc link has to be followed to
 // get there, so IN_DONT_FOLLOW must not be set
@@ -429,399 +332,517 @@ static int reopen_file_root(watch_root *root) {
     return 0;
 }
 
-// Open name n of entry beneath its root, without following symlinks, as an
-// O_PATH descriptor of a regular file, or -1. A -f file that is not found, or
-// whose watch is gone, is looked for once more in what its directory path
-// names now, as the directory may have been replaced
-static int open_name(sqwatch_config *config, const watch_entry *entry, int n, int gone) {
-    watch_root *root = &config->roots[entry->names[n].root];
-    const char *rel = rel_path(root, entry->names[n].path);
-    int fd = open_beneath(root->fd, rel, O_PATH);
-    if (root->rel && (gone || (fd == -1 && (errno == ENOENT || errno == ENOTDIR))) &&
-        reopen_file_root(root)) {
-        if (fd != -1) {
-            close(fd);
-        }
-        fd = open_beneath(root->fd, rel, O_PATH);
+// ---- tables ---------------------------------------------------------------
+
+static size_t hash_name(size_t seed, const char *name) {
+    size_t h = 14695981039346656037u ^ (seed * 0x9E3779B97F4A7C15ull);
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        h = (h ^ *p) * 1099511628211u;
     }
-    struct stat st;
-    if (fd != -1 && (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))) {
-        close(fd);
-        fd = -1;
+    return h;
+}
+
+static size_t dir_hash(const void *e) {
+    return (size_t)((unsigned)((const dir_entry *)e)->wd * 2654435761u);
+}
+static void **dir_link(void *e) {
+    return (void **)&((dir_entry *)e)->next;
+}
+static size_t dir_name_hash(const void *e) {
+    const dir_entry *d = e;
+    return hash_name((size_t)d->parent->wd, d->name);
+}
+static void **dir_name_link(void *e) {
+    return (void **)&((dir_entry *)e)->name_next;
+}
+static size_t file_hash(const void *e) {
+    const file_entry *f = e;
+    return hash_name((size_t)f->dir->wd, f->name);
+}
+static void **file_link(void *e) {
+    return (void **)&((file_entry *)e)->next;
+}
+static size_t inode_hash(dev_t dev, ino_t ino) {
+    return (size_t)(((uint64_t)ino * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)dev * 0xC2B2AE3D27D4EB4Full));
+}
+static size_t node_hash(const void *e) {
+    const inode_node *n = e;
+    return inode_hash(n->dev, n->ino);
+}
+static void **node_link(void *e) {
+    return (void **)&((inode_node *)e)->next;
+}
+
+// Put e in t under hash, growing t to keep the chains short. Returns -1 if
+// memory runs out (e is then not in t)
+static int chain_put(chain_table *t, void *e, size_t (*hash)(const void *),
+                     void **(*link)(void *)) {
+    if (t->count + 1 > t->size) {
+        size_t new_size = t->size ? t->size * 2 : 64;
+        void **buckets = calloc(new_size, sizeof(*buckets));
+        if (!buckets) {
+            if (t->size == 0) {
+                return -1;
+            }
+        } else {
+            for (size_t b = 0; b < t->size; b++) {
+                void *x = t->buckets[b];
+                while (x) {
+                    void *next = *link(x);
+                    size_t at = hash(x) & (new_size - 1);
+                    *link(x) = buckets[at];
+                    buckets[at] = x;
+                    x = next;
+                }
+            }
+            free(t->buckets);
+            t->buckets = buckets;
+            t->size = new_size;
+        }
+    }
+    size_t at = hash(e) & (t->size - 1);
+    *link(e) = t->buckets[at];
+    t->buckets[at] = e;
+    t->count++;
+    return 0;
+}
+
+// Take e out of t, where it is under hash
+static void chain_del(chain_table *t, void *e, size_t (*hash)(const void *),
+                      void **(*link)(void *)) {
+    if (t->size == 0) {
+        return;
+    }
+    void **p = &t->buckets[hash(e) & (t->size - 1)];
+    while (*p && *p != e) {
+        p = link(*p);
+    }
+    if (*p) {
+        *p = *link(e);
+        *link(e) = NULL;
+        t->count--;
+    }
+}
+
+static dir_entry *dir_find(sqwatch_config *config, int wd) {
+    if (config->dirs.size == 0 || wd < 0) {
+        return NULL;
+    }
+    dir_entry *d = config->dirs.buckets[((unsigned)wd * 2654435761u) & (config->dirs.size - 1)];
+    while (d && d->wd != wd) {
+        d = d->next;
+    }
+    return d;
+}
+
+// The subdirectory `name` of parent, if it is watched
+static dir_entry *dir_child(sqwatch_config *config, const dir_entry *parent, const char *name) {
+    if (config->dir_names.size == 0) {
+        return NULL;
+    }
+    size_t at = hash_name((size_t)parent->wd, name) & (config->dir_names.size - 1);
+    dir_entry *d = config->dir_names.buckets[at];
+    while (d && (d->parent != parent || strcmp(d->name, name) != 0)) {
+        d = d->name_next;
+    }
+    return d;
+}
+
+static file_entry *file_find(sqwatch_config *config, const dir_entry *dir, const char *name) {
+    if (config->files.size == 0) {
+        return NULL;
+    }
+    size_t at = hash_name((size_t)dir->wd, name) & (config->files.size - 1);
+    file_entry *f = config->files.buckets[at];
+    while (f && (f->dir != dir || strcmp(f->name, name) != 0)) {
+        f = f->next;
+    }
+    return f;
+}
+
+static inode_node *inode_find(sqwatch_config *config, dev_t dev, ino_t ino) {
+    if (config->inodes.size == 0) {
+        return NULL;
+    }
+    inode_node *n = config->inodes.buckets[inode_hash(dev, ino) & (config->inodes.size - 1)];
+    while (n && (n->dev != dev || n->ino != ino)) {
+        n = n->next;
+    }
+    return n;
+}
+
+// Append p to the array *a of *count, *size elements; returns -1 if memory
+// runs out
+static int push_ptr(void ***a, size_t *count, size_t *size, void *p) {
+    if (*count == *size) {
+        size_t new_size = *size ? *size * 2 : 8;
+        void **grown = realloc(*a, new_size * sizeof(*grown));
+        if (!grown) {
+            return -1;
+        }
+        *a = grown;
+        *size = new_size;
+    }
+    (*a)[(*count)++] = p;
+    return 0;
+}
+
+// Take f off the names of its inode. An inode left without names is
+// forgotten, with its cache entry
+static void inode_leave(sqwatch_config *config, file_entry *f) {
+    inode_node *n = f->inode;
+    if (!n) {
+        return;
+    }
+    file_entry *last = n->names[--n->count];
+    n->names[f->inode_at] = last;
+    last->inode_at = f->inode_at;
+    f->inode = NULL;
+    if (n->count == 0) {
+        chain_del(&config->inodes, n, node_hash, node_link);
+        if (n->cached) {
+            unlink_cache_file(n->cached);
+            free(n->cached);
+        }
+        free(n->names);
+        free(n);
+    }
+}
+
+// What f's name showed, for a name it is going to another file: its inode's
+// cache entry itself if f is that inode's only name, else a copy. Owned by
+// the caller; NULL if there is none
+static char *take_history(sqwatch_config *config, file_entry *f) {
+    inode_node *n = f->inode;
+    if (!n || !n->cached) {
+        return NULL;
+    }
+    if (n->count == 1) {
+        char *history = n->cached;
+        n->cached = NULL;
+        return history;
+    }
+    (void)config;
+    return cache_copy_entry(cache_dir, n->cached);
+}
+
+// Make history (owned) the cache entry of f's inode, unless other watched
+// names share that inode: its entry is theirs too. Returns 1 if it did
+static int give_history(file_entry *f, char *history) {
+    inode_node *n = f->inode;
+    if (!history) {
+        return 0;
+    }
+    if (!n || n->count > 1) {
+        unlink_cache_file(history);
+        free(history);
+        return 0;
+    }
+    if (n->cached) {
+        unlink_cache_file(n->cached);
+        free(n->cached);
+    }
+    n->cached = history;
+    return 1;
+}
+
+// Record that f names the inode dev/ino now. With carry, a name that goes
+// from one inode to another keeps its history: the new inode's cache entry
+// becomes what the name showed (see give_history()). Returns 1 if f's inode
+// changed and its history was carried
+static int file_set_inode(sqwatch_config *config, file_entry *f, dev_t dev, ino_t ino,
+                          int carry) {
+    if (f->inode && f->inode->dev == dev && f->inode->ino == ino) {
+        return 0;
+    }
+    char *history = carry ? take_history(config, f) : NULL;
+    inode_leave(config, f);
+    inode_node *n = inode_find(config, dev, ino);
+    if (!n) {
+        n = calloc(1, sizeof(*n));
+        if (n) {
+            n->dev = dev;
+            n->ino = ino;
+        }
+        if (!n || chain_put(&config->inodes, n, node_hash, node_link) != 0) {
+            free(n);
+            if (history) {
+                unlink_cache_file(history);
+                free(history);
+            }
+            return 0;
+        }
+    }
+    f->inode_at = n->count;
+    if (push_ptr((void ***)&n->names, &n->count, &n->size, f) != 0) {
+        if (history) {
+            unlink_cache_file(history);
+            free(history);
+        }
+        return 0;
+    }
+    f->inode = n;
+    return give_history(f, history);
+}
+
+// The cache entry of f's content, or NULL
+static const char *cache_of(const file_entry *f) {
+    return f->inode ? f->inode->cached : NULL;
+}
+
+// The displayed path of f, in buf
+static const char *file_path(const sqwatch_config *config, const file_entry *f, char *buf,
+                             size_t size) {
+    const watch_root *root = &config->roots[f->root];
+    if (root->rel) {
+        snprintf(buf, size, "%s", root->shown);
+    } else if (snprintf(buf, size, "%s/%s", f->dir->path, f->name) >= (int)size) {
+        return NULL;
+    }
+    return buf;
+}
+
+// Open the directory dir, as an O_PATH descriptor, beneath its root
+static int open_dir(sqwatch_config *config, const dir_entry *dir) {
+    watch_root *root = &config->roots[dir->root];
+    if (root->rel) {
+        return openat(root->fd, ".", O_PATH | O_DIRECTORY | O_CLOEXEC);
+    }
+    return open_beneath(root->fd, rel_path(root, dir->path), O_PATH | O_DIRECTORY);
+}
+
+// Open the file f names now, as an O_PATH descriptor of a regular file, or -1
+static int open_file(sqwatch_config *config, const file_entry *f) {
+    int dir_fd = open_dir(config, f->dir);
+    int fd = dir_fd == -1 ? -1 : open_file_at(dir_fd, f->name);
+    if (dir_fd != -1) {
+        close(dir_fd);
     }
     return fd;
 }
 
-// Whether fd is the inode entry watches
-static int is_entry_file(int fd, const watch_entry *entry) {
-    struct stat st;
-    return fstat(fd, &st) == 0 && st.st_dev == entry->dev && st.st_ino == entry->ino;
+// sqwatch's own reads of a watched file (its copies, diffs and checks) must
+// not show up as opens or accesses. Files are seen through the watch of their
+// directory, so with -q open or -q access that watch drops the read events
+// (quiet set) for the time of such a read, and gets them back after it. The
+// kernel then queues no event for these reads at all. The price: a read of
+// any file of that directory by another process in that moment is not seen
+static void own_reads(sqwatch_config *config, const dir_entry *dir, int quiet) {
+    if (!(config->flags & (IN_OPEN | IN_ACCESS))) {
+        return;
+    }
+    int fd = open_dir(config, dir);
+    if (fd != -1) {
+        uint32_t mask = dir_watch_mask(config->flags);
+        add_watch_fd(config->inotify_fd, fd, quiet ? mask & ~READ_EVENTS : mask);
+        close(fd);
+    }
 }
 
-// Open the file entry watches by the first of its names that leads to it, and
-// set *n to that name's index. Returns an O_PATH descriptor, or -1
-static int open_entry(sqwatch_config *config, const watch_entry *entry, int *n) {
-    for (*n = 0; *n < entry->name_count; (*n)++) {
-        int fd = open_name(config, entry, *n, 0);
-        if (fd != -1 && is_entry_file(fd, entry)) {
-            return fd;
+// Remove p from the lists of files with pending events or marked changed
+static void unlist(sqwatch_config *config, file_entry *f) {
+    if (f->pending_at) {
+        file_entry *last = config->pending[--config->pending_count];
+        config->pending[f->pending_at - 1] = last;
+        last->pending_at = f->pending_at;
+        f->pending_at = 0;
+        f->pending = 0;
+    }
+    if (f->changed_at) {
+        file_entry *last = config->changed[--config->changed_count];
+        config->changed[f->changed_at - 1] = last;
+        last->changed_at = f->changed_at;
+        f->changed_at = 0;
+        f->changed = 0;
+    }
+}
+
+// Forget the file f (and its inode's cache entry with its last name)
+static void file_free(sqwatch_config *config, file_entry *f) {
+    dir_entry *dir = f->dir;
+    unlist(config, f);
+    chain_del(&config->files, f, file_hash, file_link);
+    inode_leave(config, f);
+    file_entry *last = dir->files[--dir->file_count];
+    dir->files[f->dir_at] = last;
+    last->dir_at = f->dir_at;
+    free(f->name);
+    free(f);
+}
+
+// A new file entry for name in dir
+static file_entry *file_add(sqwatch_config *config, dir_entry *dir, const char *name, int root) {
+    file_entry *f = calloc(1, sizeof(*f));
+    char *copy = strdup(name);
+    if (!f || !copy) {
+        free(f);
+        free(copy);
+        return NULL;
+    }
+    f->dir = dir;
+    f->name = copy;
+    f->root = root;
+    f->dir_at = dir->file_count;
+    if (push_ptr((void ***)&dir->files, &dir->file_count, &dir->file_size, f) != 0) {
+        free(copy);
+        free(f);
+        return NULL;
+    }
+    if (chain_put(&config->files, f, file_hash, file_link) != 0) {
+        dir->file_count--;
+        free(copy);
+        free(f);
+        return NULL;
+    }
+    return f;
+}
+
+// Move f to the name `name` in dir
+static int file_rename(sqwatch_config *config, file_entry *f, dir_entry *dir, const char *name) {
+    char *copy = strdup(name);
+    if (!copy) {
+        return -1;
+    }
+    chain_del(&config->files, f, file_hash, file_link);
+    if (dir != f->dir) {
+        dir_entry *old = f->dir;
+        file_entry *last = old->files[--old->file_count];
+        old->files[f->dir_at] = last;
+        last->dir_at = f->dir_at;
+        f->dir_at = dir->file_count;
+        if (push_ptr((void ***)&dir->files, &dir->file_count, &dir->file_size, f) != 0) {
+            free(copy);
+            file_free(config, f);
+            return -1;
         }
-        if (fd != -1) {
-            close(fd);
+        f->dir = dir;
+        f->root = dir->root;
+    }
+    free(f->name);
+    f->name = copy;
+    chain_put(&config->files, f, file_hash, file_link);
+    return 0;
+}
+
+// Take dir out of its parent's subdirectories and the name table
+static void dir_unparent(sqwatch_config *config, dir_entry *dir) {
+    if (!dir->parent) {
+        return;
+    }
+    chain_del(&config->dir_names, dir, dir_name_hash, dir_name_link);
+    dir_entry *parent = dir->parent;
+    dir_entry *last = parent->subdirs[--parent->subdir_count];
+    parent->subdirs[dir->parent_at] = last;
+    last->parent_at = dir->parent_at;
+    dir->parent = NULL;
+}
+
+// Make dir the subdirectory `name` of parent (NULL: a root)
+static int dir_reparent(sqwatch_config *config, dir_entry *dir, dir_entry *parent,
+                        const char *name) {
+    dir_unparent(config, dir);
+    free(dir->name);
+    dir->name = NULL;
+    if (!parent) {
+        return 0;
+    }
+    dir->name = strdup(name);
+    dir->parent_at = parent->subdir_count;
+    if (!dir->name ||
+        push_ptr((void ***)&parent->subdirs, &parent->subdir_count, &parent->subdir_size, dir)) {
+        return -1;
+    }
+    dir->parent = parent;
+    chain_put(&config->dir_names, dir, dir_name_hash, dir_name_link);
+    return 0;
+}
+
+// Stop watching dir and everything beneath it: the kernel watches, unless
+// watch_gone (the kernel took dir's own away already), and the files with
+// their cache entries. Iterative, and it checks for signals as it goes
+static void dir_drop(sqwatch_config *config, dir_entry *dir, int watch_gone) {
+    dir_unparent(config, dir);
+    dir_entry **stack = NULL;
+    size_t depth = 0, size = 0, steps = 0;
+    if (push_ptr((void ***)&stack, &depth, &size, dir) != 0) {
+        return;
+    }
+    while (depth > 0) {
+        dir_entry *d = stack[depth - 1];
+        if ((++steps & 255) == 0) {
+            stop_if_signalled();
+        }
+        if (d->subdir_count > 0) {
+            dir_entry *sub = d->subdirs[d->subdir_count - 1];
+            dir_unparent(config, sub);
+            if (push_ptr((void ***)&stack, &depth, &size, sub) != 0) {
+                break;
+            }
+            continue;
+        }
+        depth--;
+        while (d->file_count > 0) {
+            file_free(config, d->files[d->file_count - 1]);
+        }
+        if (d != dir || !watch_gone) {
+            inotify_rm_watch(config->inotify_fd, d->wd);
+        }
+        chain_del(&config->dirs, d, dir_hash, dir_link);
+        for (int i = 0; i < d->only_count; i++) {
+            free(d->only[i]);
+        }
+        free(d->only);
+        free(d->subdirs);
+        free(d->files);
+        free(d->path);
+        free(d->name);
+        free(d);
+    }
+    free(stack);
+}
+
+// Give dir and everything beneath it the displayed path that follows from
+// path, after a rename
+static void dir_repath(dir_entry *dir, const char *path) {
+    dir_entry **stack = NULL;
+    size_t depth = 0, size = 0;
+    char *copy = strdup(path);
+    if (!copy) {
+        return;
+    }
+    free(dir->path);
+    dir->path = copy;
+    for (size_t i = 0; i < dir->subdir_count; i++) {
+        push_ptr((void ***)&stack, &depth, &size, dir->subdirs[i]);
+    }
+    while (depth > 0) {
+        dir_entry *d = stack[--depth];
+        char *p;
+        if (asprintf(&p, "%s/%s", d->parent->path, d->name) >= 0) {
+            free(d->path);
+            d->path = p;
+        }
+        for (size_t i = 0; i < d->subdir_count; i++) {
+            push_ptr((void ***)&stack, &depth, &size, d->subdirs[i]);
         }
     }
-    return -1;
+    free(stack);
 }
 
-static size_t inode_hash(dev_t dev, ino_t ino) {
-  return (size_t)(((uint64_t)ino * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)dev * 0xC2B2AE3D27D4EB4Full));
-}
-
-// The slot of dev/ino in the inode index, or the free slot where it would go
-static inode_slot *inode_slot_of(const inode_index *index, dev_t dev, ino_t ino) {
-  size_t mask = index->size - 1;
-  for (size_t s = inode_hash(dev, ino) & mask;; s = (s + 1) & mask) {
-    inode_slot *slot = &index->slots[s];
-    if (slot->wd < 0 || (slot->dev == dev && slot->ino == ino)) {
-      return slot;
+// Note that the file f has to be diffed against its cache entry: it took over
+// the entry of a name it replaced (CHANGED_TAKEOVER, CHANGED_CREATED), or a
+// rescan found it differs (CHANGED_RESCAN). handle_events() goes through the
+// list
+static void mark_changed(sqwatch_config *config, file_entry *f, unsigned char why) {
+    if (f->changed_at) {
+        return;
     }
-  }
-}
-
-static void inode_put(inode_index *index, dev_t dev, ino_t ino, int wd) {
-  if ((index->count + 1) * 4 > index->size * 3) {
-    size_t new_size = index->size ? index->size * 2 : 64;
-    inode_slot *slots = malloc(new_size * sizeof(*slots));
-    if (!slots) {
-      return;
+    if (push_ptr((void ***)&config->changed, &config->changed_count, &config->changed_size, f)) {
+        fprintf(stderr, RED "+ Out of memory, a change may not be shown\n" RESET);
+        return;
     }
-    for (size_t s = 0; s < new_size; s++) {
-      slots[s].wd = -1;
-    }
-    inode_index grown = {slots, new_size, index->count};
-    for (size_t s = 0; s < index->size; s++) {
-      if (index->slots[s].wd >= 0) {
-        *inode_slot_of(&grown, index->slots[s].dev, index->slots[s].ino) = index->slots[s];
-      }
-    }
-    free(index->slots);
-    *index = grown;
-  }
-  inode_slot *slot = inode_slot_of(index, dev, ino);
-  if (slot->wd < 0) {
-    index->count++;
-  }
-  *slot = (inode_slot){dev, ino, wd};
-}
-
-static void inode_del(inode_index *index, dev_t dev, ino_t ino) {
-  if (index->size == 0) {
-    return;
-  }
-  size_t mask = index->size - 1;
-  inode_slot *slot = inode_slot_of(index, dev, ino);
-  if (slot->wd < 0) {
-    return;
-  }
-  size_t hole = (size_t)(slot - index->slots);
-  for (size_t s = (hole + 1) & mask; index->slots[s].wd >= 0; s = (s + 1) & mask) {
-    size_t home = inode_hash(index->slots[s].dev, index->slots[s].ino) & mask;
-    if (((s - home) & mask) >= ((s - hole) & mask)) {
-      index->slots[hole] = index->slots[s];
-      hole = s;
-    }
-  }
-  index->slots[hole].wd = -1;
-  index->count--;
-}
-
-static size_t hash_path(const char *path) {
-  size_t h = 14695981039346656037u;
-  for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
-    h = (h ^ *p) * 1099511628211u;
-  }
-  return h;
-}
-
-// The slot of path in the name index, or of the free slot where it would go
-static name_slot *name_slot_of(const name_index *index, const char *path, size_t hash) {
-  size_t mask = index->size - 1;
-  for (size_t s = hash & mask;; s = (s + 1) & mask) {
-    name_slot *slot = &index->slots[s];
-    if (!slot->path || (slot->hash == hash && strcmp(slot->path, path) == 0)) {
-      return slot;
-    }
-  }
-}
-
-// The watch descriptor whose names include path, or -1
-static int name_wd(const name_index *index, const char *path) {
-  if (index->size == 0) {
-    return -1;
-  }
-  name_slot *slot = name_slot_of(index, path, hash_path(path));
-  return slot->path ? slot->wd : -1;
-}
-
-// Record that path, a string the caller keeps, names watch wd
-static int name_put(name_index *index, const char *path, int wd) {
-  if ((index->count + 1) * 4 > index->size * 3) {
-    size_t new_size = index->size ? index->size * 2 : 64;
-    name_slot *slots = calloc(new_size, sizeof(*slots));
-    if (!slots) {
-      return -1;
-    }
-    name_index grown = {slots, new_size, index->count};
-    for (size_t s = 0; s < index->size; s++) {
-      if (index->slots[s].path) {
-        *name_slot_of(&grown, index->slots[s].path, index->slots[s].hash) = index->slots[s];
-      }
-    }
-    free(index->slots);
-    *index = grown;
-  }
-  size_t hash = hash_path(path);
-  name_slot *slot = name_slot_of(index, path, hash);
-  if (!slot->path) {
-    index->count++;
-  }
-  *slot = (name_slot){path, hash, wd};
-  return 0;
-}
-
-static void name_del(name_index *index, const char *path) {
-  if (index->size == 0) {
-    return;
-  }
-  size_t mask = index->size - 1;
-  name_slot *slot = name_slot_of(index, path, hash_path(path));
-  if (!slot->path) {
-    return;
-  }
-  size_t hole = (size_t)(slot - index->slots);
-  for (size_t s = (hole + 1) & mask; index->slots[s].path; s = (s + 1) & mask) {
-    size_t home = index->slots[s].hash & mask;
-    if (((s - home) & mask) >= ((s - hole) & mask)) {
-      index->slots[hole] = index->slots[s];
-      hole = s;
-    }
-  }
-  index->slots[hole].path = NULL;
-  index->count--;
-}
-
-// Take name n away from entry, keeping the order of the others
-static void remove_name(sqwatch_config *config, watch_entry *entry, int n) {
-  name_del(&config->names, entry->names[n].path);
-  free(entry->names[n].path);
-  entry->name_count--;
-  memmove(&entry->names[n], &entry->names[n + 1],
-          (entry->name_count - n) * sizeof(*entry->names));
-}
-
-// Stop watching wd: the kernel watch, unless it is gone already, the cache
-// entry and every name of it. shown names the file in a verbose message
-static void drop_watch(int inotify_fd, sqwatch_config *config, int wd, int watch_gone,
-                       const char *shown) {
-  watch_entry *entry = watch_find(&config->watches, wd);
-  if (!entry) {
-    return;
-  }
-  if (!watch_gone) {
-    inotify_rm_watch(inotify_fd, wd);
-  }
-  if (entry->cached) {
-    if (config->verbose) {
-      printf(DARK_GREY "+ Removing cache for: %s\n" RESET,
-             shown_name(shown ? shown : entry->name_count ? entry->names[0].path : "?"));
-    }
-    unlink_cache_file(entry->cached);
-  }
-  while (entry->name_count > 0) {
-    remove_name(config, entry, entry->name_count - 1);
-  }
-  if (!entry->is_dir) {
-    inode_del(&config->inodes, entry->dev, entry->ino);
-  }
-  watch_remove(&config->watches, entry);
-}
-
-// Note that the file watched by wd has to be diffed against its cache entry:
-// it took over the entry of a name it replaced (CHANGED_TAKEOVER), or a rescan
-// found it differs (CHANGED_RESCAN). handle_events() goes through the list
-static void mark_changed(sqwatch_config *config, int wd, unsigned char why) {
-  watch_entry *entry = watch_find(&config->watches, wd);
-  if (!entry || entry->changed) {
-    return;
-  }
-  if (config->changed_count == config->changed_size) {
-    size_t new_size = config->changed_size ? config->changed_size * 2 : 16;
-    int *grown = realloc(config->changed, new_size * sizeof(*grown));
-    if (!grown) {
-      fprintf(stderr, RED "+ Out of memory, a change may not be shown\n" RESET);
-      return;
-    }
-    config->changed = grown;
-    config->changed_size = new_size;
-  }
-  config->changed[config->changed_count++] = wd;
-  entry->changed = why;
-}
-
-// path is not a name of what it was watched as any more: it was removed,
-// moved away or replaced. A watch with no name left in the tree is dropped,
-// one with another name (a hard link) is kept
-static void drop_name(int inotify_fd, sqwatch_config *config, const char *path) {
-  int wd = name_wd(&config->names, path);
-  watch_entry *entry = watch_find(&config->watches, wd);
-  if (!entry) {
-    return;
-  }
-  for (int n = 0; n < entry->name_count; n++) {
-    if (strcmp(entry->names[n].path, path) == 0) {
-      if (config->verbose && !entry->is_dir) {
-        printf(DARK_GREY "+ File no longer exists: %s\n" RESET, shown_name(path));
-      }
-      remove_name(config, entry, n);
-      break;
-    }
-  }
-  if (entry->name_count == 0) {
-    drop_watch(inotify_fd, config, wd, 0, path);
-  }
-}
-
-// drop_name() for path and for every name beneath it
-static void drop_tree(int inotify_fd, sqwatch_config *config, const char *path) {
-  size_t len = strlen(path);
-  char **below = NULL;
-  size_t count = 0, size = 0;
-  for (size_t s = 0; s < config->watches.size; s++) {
-    const watch_entry *entry = &config->watches.slots[s];
-    for (int n = 0; entry->wd >= 0 && n < entry->name_count; n++) {
-      const char *name = entry->names[n].path;
-      if (strncmp(name, path, len) != 0 || name[len] != '/') {
-        continue;
-      }
-      if (count == size) {
-        size_t new_size = size ? size * 2 : 64;
-        char **grown = realloc(below, new_size * sizeof(*grown));
-        if (!grown) {
-          break;
-        }
-        below = grown;
-        size = new_size;
-      }
-      below[count] = strdup(name);
-      if (below[count]) {
-        count++;
-      }
-    }
-  }
-  for (size_t i = 0; i < count; i++) {
-    drop_name(inotify_fd, config, below[i]);
-    free(below[i]);
-  }
-  free(below);
-  drop_name(inotify_fd, config, path);
-}
-
-// Record that path, in root, names the file or directory fd, watched as wd.
-// If path named another file before (it was replaced: renamed over, or moved
-// away and made again), this file takes over that file's cache entry, which
-// holds what the name showed before, and is marked changed, to be diffed. The
-// other file gets a fresh cache entry if it still has a name, and its watch
-// is dropped if not. A
-// directory has one name, the last it was found by. Returns the entry, or NULL
-static watch_entry *attach_name(int inotify_fd, sqwatch_config *config, int wd, int fd,
-                                int is_dir, const char *path, int root, int *added) {
-  watch_entry *entry = watch_add(&config->watches, wd);
-  struct stat st;
-  *added = 0;
-  if (!entry) {
-    fprintf(stderr, RED "+ Out of memory, not watching %s\n" RESET, shown_name(path));
-    return NULL;
-  }
-  if (entry->name_count == 0) {
-    if (fstat(fd, &st) == 0) {
-      entry->dev = st.st_dev;
-      entry->ino = st.st_ino;
-      if (!is_dir) {
-        inode_put(&config->inodes, st.st_dev, st.st_ino, wd);
-      }
-    }
-    entry->is_dir = is_dir;
-  }
-
-  int old = name_wd(&config->names, path);
-  if (old == wd) {
-    for (int n = 0; n < entry->name_count; n++) {
-      if (strcmp(entry->names[n].path, path) == 0) {
-        entry->names[n].seen = config->scan;
-        entry->names[n].root = root;
-      }
-    }
-    return entry;
-  }
-  if (old >= 0) {
-    watch_entry *before = watch_find(&config->watches, old);
-    for (int n = 0; n < before->name_count; n++) {
-      if (strcmp(before->names[n].path, path) == 0) {
-        remove_name(config, before, n);
-        break;
-      }
-    }
-    if (!is_dir && !before->is_dir && before->cached) {
-      // The cache entry holds what path showed: it goes with the name. A
-      // file still watched under another name gets a fresh copy of its own
-      char *fresh = NULL;
-      int n;
-      int other = open_entry(config, before, &n);
-      if (other != -1) {
-        char io_path[FD_PATH_LEN];
-        fd_path(other, io_path, sizeof(io_path));
-        own_reads(config, io_path, 1);
-        create_cache_for_file(before->names[n].path, io_path, cache_dir, &fresh, 0);
-        own_reads(config, io_path, 0);
-      }
-      if (other != -1) {
-        close(other);
-      }
-      if (entry->cached) {
-        unlink_cache_file(entry->cached);
-        free(entry->cached);
-      }
-      entry->cached = before->cached;
-      before->cached = fresh;
-      mark_changed(config, wd, config->creating ? CHANGED_CREATED : CHANGED_TAKEOVER);
-    }
-    if (before->name_count == 0) {
-      drop_watch(inotify_fd, config, old, 0, path);
-      entry = watch_find(&config->watches, wd);
-    }
-  }
-  if (is_dir) {
-    while (entry->name_count > 0) {
-      remove_name(config, entry, entry->name_count - 1);
-    }
-  }
-
-  watch_name *names = realloc(entry->names, (entry->name_count + 1) * sizeof(*names));
-  char *copy = strdup(path);
-  if (names) {
-    entry->names = names;
-  }
-  if (!names || !copy || name_put(&config->names, copy, wd) != 0) {
-    free(copy);
-    fprintf(stderr, RED "+ Out of memory, not watching %s\n" RESET, shown_name(path));
-    if (entry->name_count == 0) {
-      drop_watch(inotify_fd, config, wd, 0, path);
-    }
-    return NULL;
-  }
-  entry->names[entry->name_count++] = (watch_name){copy, root, config->scan};
-  *added = 1;
-  return entry;
+    f->changed_at = config->changed_count;
+    f->changed = why;
 }
 
 // Whether the entry whose displayed path is path, in root, is ignored: it
@@ -848,41 +869,177 @@ static int is_ignored(const sqwatch_config *config, int root, const char *path) 
     return 0;
 }
 
-// Watch the regular file `name` in the directory parent_fd; path is its
-// displayed path. A file found after startup (at_runtime) is cached here, if
-// it has no cache entry yet; at_runtime 2 is a file that was just created or
-// moved into the tree
-static void watch_file(int inotify_fd, int parent_fd, const char *name, const char *path,
-                       int root, uint32_t flags, sqwatch_config *config, int at_runtime) {
+// A name that went away inside the tree, renamed to another watched name, or
+// out of the tree with its history kept for a while: whatever is made under
+// the old name soon after (an editor that moves the file aside to write a new
+// one) takes over that history
+#define DEPARTED_SLOTS 64
+#define DEPARTED_MS 3000
+typedef struct {
+    int wd;                  // Where the name was: directory wd and name
+    char name[NAME_MAX + 1];
+    int to_wd;               // Renamed: the file now has this name ...
+    char to_name[NAME_MAX + 1];
+    char *cached;            // ... else moved out: its cache entry, kept here
+    long long when;          // ms of CLOCK_MONOTONIC; 0: a free slot
+} departed_name;
+static departed_name departed[DEPARTED_SLOTS];
+
+static long long clock_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000 + 1;
+}
+
+static void departed_clear(departed_name *d) {
+    if (d->cached) {
+        unlink_cache_file(d->cached);
+        free(d->cached);
+        d->cached = NULL;
+    }
+    d->when = 0;
+}
+
+// Remember that name left dir; to (when it was renamed within the tree) is
+// where the file went, else cached (moved out) is kept here
+static void departed_add(const dir_entry *dir, const char *name, const file_entry *to,
+                         char *cached) {
+    long long now = clock_ms();
+    departed_name *slot = &departed[0];
+    for (int i = 0; i < DEPARTED_SLOTS; i++) {
+        if (departed[i].when == 0 || now - departed[i].when > DEPARTED_MS) {
+            slot = &departed[i];
+            break;
+        }
+        if (departed[i].when < slot->when) {
+            slot = &departed[i];
+        }
+    }
+    departed_clear(slot);
+    if (strlen(name) > NAME_MAX || (to && strlen(to->name) > NAME_MAX)) {
+        if (cached) {
+            unlink_cache_file(cached);
+            free(cached);
+        }
+        return;
+    }
+    slot->wd = dir->wd;
+    strcpy(slot->name, name);
+    slot->to_wd = to ? to->dir->wd : -1;
+    strcpy(slot->to_name, to ? to->name : "");
+    slot->cached = cached;
+    slot->when = now;
+}
+
+// Forget the departed names older than DEPARTED_MS, or all of them; returns
+// the ms until the next one expires, or -1
+static long long departed_expire(int all) {
+    long long now = clock_ms(), next = -1;
+    for (int i = 0; i < DEPARTED_SLOTS; i++) {
+        if (departed[i].when == 0) {
+            continue;
+        }
+        long long left = departed[i].when + DEPARTED_MS - now;
+        if (all || left <= 0) {
+            departed_clear(&departed[i]);
+        } else if (next < 0 || left < next) {
+            next = left;
+        }
+    }
+    return next;
+}
+
+// The new file f takes over the history of its name if the name left a
+// moment ago: the cache entry of the file that had it (which gets a fresh
+// copy of its own), or the one kept for it. Returns 1 if it did
+static int take_departed(sqwatch_config *config, file_entry *f) {
+    long long now = clock_ms();
+    for (int i = 0; i < DEPARTED_SLOTS; i++) {
+        departed_name *d = &departed[i];
+        if (d->when == 0 || now - d->when > DEPARTED_MS || d->wd != f->dir->wd ||
+            strcmp(d->name, f->name) != 0) {
+            continue;
+        }
+        char *history = NULL;
+        if (d->cached) {
+            history = d->cached;
+            d->cached = NULL;
+        } else {
+            // Renamed: the file under its new name keeps its entry, which
+            // still holds what this name showed; the new file gets a copy
+            dir_entry *to_dir = dir_find(config, d->to_wd);
+            file_entry *to = to_dir ? file_find(config, to_dir, d->to_name) : NULL;
+            if (to && cache_of(to)) {
+                history = cache_copy_entry(cache_dir, cache_of(to));
+            }
+        }
+        d->when = 0;
+        if (!give_history(f, history)) {
+            return 0;
+        }
+        mark_changed(config, f, config->creating ? CHANGED_CREATED : CHANGED_TAKEOVER);
+        return 1;
+    }
+    return 0;
+}
+
+// Watch the regular file `name` in the directory dir, open as dir_fd; path is
+// its displayed path. A file found after startup (at_runtime) is cached here,
+// if it has no cache entry yet; at_runtime 2 is a file that was just created
+// or moved into the tree. root is the -f root of a -f file, else dir's.
+// Returns the entry, or NULL
+static file_entry *watch_file(sqwatch_config *config, dir_entry *dir, int dir_fd,
+                              const char *name, const char *path, int root, int at_runtime) {
     if (is_ignored(config, root, path)) {
         if (config->verbose) {
             printf(DARK_GREY "+ Ignoring %s\n" RESET, shown_name(path));
         }
-        return;
+        return NULL;
     }
-    int fd = open_file_at(parent_fd, name);
-    if (fd != -1 && is_log_file(fd)) {
+    int fd = open_file_at(dir_fd, name);
+    struct stat st;
+    if (fd == -1 || fstat(fd, &st) != 0) {
+        if (fd != -1) {
+            close(fd);
+        }
+        return NULL;
+    }
+    if (is_log_file(fd)) {
         if (config->verbose) {
             printf(DARK_GREY "+ Not watching the log file %s\n" RESET, shown_name(path));
         }
         close(fd);
-        return;
+        return NULL;
     }
-    int wd = fd == -1 ? -1 : add_watch_fd(inotify_fd, fd, file_watch_mask(flags));
-    int added = 0;
-    watch_entry *entry = wd < 0 ? NULL :
-        attach_name(inotify_fd, config, wd, fd, 0, path, root, &added);
+    file_entry *f = file_find(config, dir, name);
+    int added = !f;
+    if (added) {
+        f = file_add(config, dir, name, root);
+        if (!f) {
+            fprintf(stderr, RED "+ Out of memory, not watching %s\n" RESET, shown_name(path));
+            close(fd);
+            return NULL;
+        }
+    }
+    f->seen = config->scan;
+    if (file_set_inode(config, f, st.st_dev, st.st_ino, !added)) {
+        // Replaced since it was seen (events were lost): diff it against what
+        // the name showed
+        mark_changed(config, f, CHANGED_TAKEOVER);
+    }
+    char io_path[FD_PATH_LEN];
+    fd_path(fd, io_path, sizeof(io_path));
     // A directory's mark covers its files; a -f file is marked on its own
-    if (entry && perm_active() && config->roots[root].rel) {
-        char io_path[FD_PATH_LEN];
-        perm_mark(fd_path(fd, io_path, sizeof(io_path)), 0);
+    if (perm_active() && config->roots[root].rel) {
+        perm_mark(io_path, 0);
     }
-    if (entry && at_runtime && config->diff_enabled && cache_dir && !entry->cached) {
-        char io_path[FD_PATH_LEN];
-        fd_path(fd, io_path, sizeof(io_path));
-        own_reads(config, io_path, 1);
-        create_cache_for_file(path, io_path, cache_dir, &entry->cached, config->verbose);
-        own_reads(config, io_path, 0);
+    if (added && at_runtime) {
+        take_departed(config, f);
+    }
+    if (at_runtime && config->diff_enabled && cache_dir && f->inode && !f->inode->cached) {
+        own_reads(config, dir, 1);
+        create_cache_for_file(path, io_path, cache_dir, &f->inode->cached, config->verbose);
+        own_reads(config, dir, 0);
     }
     if (added && config->verbose) {
         if (at_runtime == 2) {
@@ -891,26 +1048,75 @@ static void watch_file(int inotify_fd, int parent_fd, const char *name, const ch
             printf(CYAN "+ Watch set for file %s\n" RESET, shown_name(path));
         }
     }
-    if (fd != -1) {
-        close(fd);
-    }
+    close(fd);
+    return f;
 }
 
-// Watch the directory dir_fd refers to; path is its displayed path
-static void watch_dir(int inotify_fd, int dir_fd, const char *path, int root, uint32_t flags,
-                      sqwatch_config *config) {
-    int wd = add_watch_fd(inotify_fd, dir_fd, dir_watch_mask(flags));
-    int added = 0;
-    if (wd >= 0 && perm_active()) {
+// Say once, loudly, that a watch could not be set: what is beneath that
+// directory is not seen. The event loop treats it like lost events
+static void watch_failed(sqwatch_config *config, const char *path, int error) {
+    if (!config->watch_failed) {
+        fprintf(stderr, RED "+ Cannot watch %s: %s. sqwatch does not see everything now: "
+                "changes beneath it are missed%s\n" RESET, shown_name(path), strerror(error),
+                error == ENOSPC ? " (the inotify watch limit, fs.inotify.max_user_watches, "
+                                  "is reached)" : "");
+    }
+    config->watch_failed++;
+}
+
+// Watch the directory dir_fd refers to; path is its displayed path, name its
+// name in parent (NULL for a root). A directory watched before (walked again,
+// or renamed) gets the wd it already has: its entry is updated. Returns the
+// entry, or NULL
+static dir_entry *watch_dir(sqwatch_config *config, int dir_fd, const char *path,
+                            dir_entry *parent, const char *name, int root, int full) {
+    int wd = add_watch_fd(config->inotify_fd, dir_fd, dir_watch_mask(config->flags));
+    if (wd < 0) {
+        watch_failed(config, path, errno);
+        return NULL;
+    }
+    struct stat st;
+    dir_entry *dir = dir_find(config, wd);
+    if (dir) {
+        if (strcmp(dir->path, path) != 0 || dir->parent != parent) {
+            if (dir_reparent(config, dir, parent, name) == 0) {
+                dir_repath(dir, path);
+            }
+        }
+        dir->full |= full;
+        dir->seen = config->scan;
+        return dir;
+    }
+    dir = calloc(1, sizeof(*dir));
+    char *copy = strdup(path);
+    if (!dir || !copy || fstat(dir_fd, &st) != 0) {
+        free(dir);
+        free(copy);
+        inotify_rm_watch(config->inotify_fd, wd);
+        fprintf(stderr, RED "+ Out of memory, not watching %s\n" RESET, shown_name(path));
+        return NULL;
+    }
+    dir->wd = wd;
+    dir->path = copy;
+    dir->root = root;
+    dir->full = full;
+    dir->dev = st.st_dev;
+    dir->ino = st.st_ino;
+    dir->seen = config->scan;
+    if (chain_put(&config->dirs, dir, dir_hash, dir_link) != 0 ||
+        dir_reparent(config, dir, parent, name) != 0) {
+        fprintf(stderr, RED "+ Out of memory, not watching %s\n" RESET, shown_name(path));
+        dir_drop(config, dir, 0);
+        return NULL;
+    }
+    if (perm_active()) {
         char io_path[FD_PATH_LEN];
         perm_mark(fd_path(dir_fd, io_path, sizeof(io_path)), 1);
     }
-    // A directory watched before (walked again, or reached by another name)
-    // gets the wd it already has: its entry is updated
-    if (wd >= 0 && attach_name(inotify_fd, config, wd, dir_fd, 1, path, root, &added) &&
-        added && config->verbose) {
+    if (config->verbose) {
         printf(CYAN "+ Watch set for directory %s\n" RESET, shown_name(path));
     }
+    return dir;
 }
 
 // A directory the walk is in, from where it started down to the current one
@@ -921,6 +1127,7 @@ typedef struct {
     dev_t dev;               // The directory found and watched, to know it
     ino_t ino;               // again when the walk comes back to it
     size_t path_len;         // Length of its displayed path in the path buffer
+    dir_entry *dir;          // Its entry
 } walk_level;
 
 static void free_level(walk_level *level) {
@@ -943,8 +1150,8 @@ static int is_level_dir(int fd, const walk_level *level) {
 // subdirectories. The type comes from readdir(), or from fstatat() on a
 // filesystem that does not give it. fd stays open and usable. Returns -1 with
 // errno set if the directory cannot be read
-static int read_names(int inotify_fd, int fd, char *path, int root, uint32_t flags,
-                      sqwatch_config *config, int at_runtime, walk_level *level) {
+static int read_names(sqwatch_config *config, int fd, char *path, int root, int at_runtime,
+                      walk_level *level) {
     int dir_fd = dup(fd);
     DIR *dir = dir_fd == -1 ? NULL : fdopendir(dir_fd);
     if (!dir) {
@@ -958,7 +1165,7 @@ static int read_names(int inotify_fd, int fd, char *path, int root, uint32_t fla
     size_t len = strlen(path), size = 0, seen = 0;
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
-        if ((++seen & 1023) == 0) {
+        if ((++seen & 255) == 0) {
             stop_if_signalled();
         }
         const char *name = entry->d_name;
@@ -990,7 +1197,7 @@ static int read_names(int inotify_fd, int fd, char *path, int root, uint32_t fla
             if (type == DT_LNK && config->verbose) {
                 printf(DARK_GREY "+ Skipping symlink %s\n" RESET, shown_name(path));
             } else if (type == DT_REG) {
-                watch_file(inotify_fd, fd, name, path, root, flags, config, at_runtime);
+                watch_file(config, level->dir, fd, name, path, root, at_runtime);
             }
             path[len] = '\0';
             if (type != DT_DIR) {
@@ -1020,11 +1227,11 @@ static int read_names(int inotify_fd, int fd, char *path, int root, uint32_t fla
 }
 
 // Watch the directory fd refers to, whose displayed path is the walk's path
-// buffer, watch its files and make it the innermost level, holding its
-// subdirectories. Returns 0 if it could not be read; fd is the caller's either
-// way
-static int enter_dir(int inotify_fd, int fd, char *path, int root, uint32_t flags,
-                     sqwatch_config *config, int at_runtime, walk_level **levels,
+// buffer and whose name in parent is name, watch its files and make it the
+// innermost level, holding its subdirectories. Returns 0 if it could not be
+// read; fd is the caller's either way
+static int enter_dir(sqwatch_config *config, int fd, char *path, dir_entry *parent,
+                     const char *name, int root, int at_runtime, walk_level **levels,
                      size_t *depth, size_t *size) {
     struct stat st;
     // An ignored directory, or sqwatch's own cache, is neither watched nor
@@ -1051,10 +1258,13 @@ static int enter_dir(int inotify_fd, int fd, char *path, int root, uint32_t flag
         *levels = grown;
         *size = new_size;
     }
-    watch_dir(inotify_fd, fd, path, root, flags, config);
+    dir_entry *dir = watch_dir(config, fd, path, parent, name, root, 1);
+    if (!dir) {
+        return 0;  // Without a watch nothing beneath it would be seen
+    }
     walk_level *level = &(*levels)[*depth];
-    *level = (walk_level){NULL, 0, 0, st.st_dev, st.st_ino, strlen(path)};
-    if (read_names(inotify_fd, fd, path, root, flags, config, at_runtime, level) != 0) {
+    *level = (walk_level){NULL, 0, 0, st.st_dev, st.st_ino, strlen(path), dir};
+    if (read_names(config, fd, path, root, at_runtime, level) != 0) {
         fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, shown_name(path),
                 strerror(errno));
         return 0;
@@ -1098,23 +1308,21 @@ static int climb(int child_fd, const watch_root *top, char *path, walk_level *le
     return -1;
 }
 
-// Add watches for the entry `name` of the directory parent_fd and, if it is a
-// directory, for everything below it. path is the entry's displayed path.
-// The walk is depth first. The files of a directory are watched while it is
-// read, before any of its subdirectories is entered; the recursive walk of
-// v0.4.1 took files and subdirectories in readdir order instead.
-// It holds one descriptor, of the directory it is in, and keeps the names of
-// the subdirectories still to walk of each directory on the way down on the
-// heap: there is no recursion and no descriptor held per level, however deep
-// the tree. A directory is read in full when the walk enters it, as a readdir
-// position cannot be kept without keeping its stream open. Directories are
-// entered with openat() relative to the current one and left through "..",
-// checked to be the directory entered before; symlinks are never followed, so
-// the walk cannot leave the tree it started in. at_runtime is set for an
-// entry found after startup: its files are cached here, as
+// Add watches for the entry `name` of the directory parent (open as
+// parent_fd; NULL for a -d root, whose parent_fd is the root and name ".")
+// and, if it is a directory, for everything below it. path is the entry's
+// displayed path. The walk is depth first. The files of a directory are
+// watched while it is read, before any of its subdirectories is entered. It
+// holds one descriptor, of the directory it is in, and keeps the names of the
+// subdirectories still to walk of each directory on the way down on the heap:
+// there is no recursion and no descriptor held per level, however deep the
+// tree. Directories are entered with openat() relative to the current one and
+// left through "..", checked to be the directory entered before; symlinks are
+// never followed, so the walk cannot leave the tree it started in. at_runtime
+// is set for an entry found after startup: its files are cached here, as
 // cache_watched_files() only covers the startup walk; see watch_file()
-static void add_watches_walk(int inotify_fd, int parent_fd, const char *name, const char *path,
-                             int root, uint32_t flags, sqwatch_config *config, int at_runtime) {
+static void add_watches_walk(sqwatch_config *config, dir_entry *parent, int parent_fd,
+                             const char *name, const char *path, int root, int at_runtime) {
     const watch_root *top = &config->roots[root];
     struct stat path_stat;
     if (fstatat(parent_fd, name, &path_stat, AT_SYMLINK_NOFOLLOW) == -1) {
@@ -1130,12 +1338,12 @@ static void add_watches_walk(int inotify_fd, int parent_fd, const char *name, co
     }
 
     if (S_ISREG(path_stat.st_mode)) {
-        watch_file(inotify_fd, parent_fd, name, path, root, flags, config, at_runtime);
+        if (parent) {
+            watch_file(config, parent, parent_fd, name, path, root, at_runtime);
+        }
         return;
     }
 
-    // A -f root names one file; if it has been replaced by a directory since it
-    // was checked, nothing is watched
     if (!S_ISDIR(path_stat.st_mode) || top->rel) {
         return;
     }
@@ -1157,8 +1365,8 @@ static void add_watches_walk(int inotify_fd, int parent_fd, const char *name, co
 
     walk_level *levels = NULL;
     size_t depth = 0, size = 0;
-    if (!enter_dir(inotify_fd, cur, dir_path, root, flags, config, at_runtime, &levels, &depth,
-                   &size)) {
+    if (!enter_dir(config, cur, dir_path, parent, parent ? name : NULL, root, at_runtime,
+                   &levels, &depth, &size)) {
         close(cur);
         free(levels);
         return;
@@ -1197,14 +1405,14 @@ static void add_watches_walk(int inotify_fd, int parent_fd, const char *name, co
                 printf(DARK_GREY "+ Skipping symlink %s\n" RESET, shown_name(dir_path));
             }
         } else if (S_ISREG(st.st_mode)) {
-            watch_file(inotify_fd, cur, entry, dir_path, root, flags, config, at_runtime);
+            watch_file(config, level->dir, cur, entry, dir_path, root, at_runtime);
         } else if (S_ISDIR(st.st_mode)) {
             int fd = openat(cur, entry, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
             if (fd == -1) {
                 fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET,
                         shown_name(dir_path),
                         strerror(errno));
-            } else if (enter_dir(inotify_fd, fd, dir_path, root, flags, config, at_runtime,
+            } else if (enter_dir(config, fd, dir_path, level->dir, entry, root, at_runtime,
                                  &levels, &depth, &size)) {
                 close(cur);
                 cur = fd;
@@ -1218,25 +1426,61 @@ static void add_watches_walk(int inotify_fd, int parent_fd, const char *name, co
     free(levels);
 }
 
+// Watch the file of the -f root r through its directory: the directory's
+// watch, limited to that name unless the directory is walked anyway
+static void watch_file_root(sqwatch_config *config, int r, int at_runtime) {
+    watch_root *root = &config->roots[r];
+    dir_entry *dir = watch_dir(config, root->fd, root->path, NULL, NULL, r, 0);
+    if (!dir) {
+        return;
+    }
+    int listed = 0;
+    for (int i = 0; i < dir->only_count; i++) {
+        listed |= strcmp(dir->only[i], root->rel) == 0;
+    }
+    if (!listed) {
+        char **grown = realloc(dir->only, (dir->only_count + 1) * sizeof(*grown));
+        char *copy = strdup(root->rel);
+        if (!grown || !copy) {
+            free(copy);
+            if (grown) {
+                dir->only = grown;
+            }
+            fprintf(stderr, RED "+ Out of memory, not watching %s\n" RESET,
+                    shown_name(root->shown));
+            return;
+        }
+        dir->only = grown;
+        dir->only[dir->only_count++] = copy;
+    }
+    watch_file(config, dir, root->fd, root->rel, root->shown, r, at_runtime);
+}
+
 // Start watching a path named on the command line. This and
 // reopen_file_root() are the only places where symlinks are followed: the
 // operator's path is trusted, what is found beneath it later is not
 void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags,
                            sqwatch_config *config) {
+    (void)inotify_fd;
+    (void)flags;
     struct stat path_stat;
     if (stat(path, &path_stat) == -1) {
         fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, shown_name(path), strerror(errno));
         return;
     }
     watch_root *root = &config->roots[config->root_count];
-    const char *name = ".";
     root->path = NULL;
     root->rel = NULL;
     root->fd = -1;
     root->shown = strdup(path);
 
     if (S_ISDIR(path_stat.st_mode)) {
+        // A trailing '/' is dropped, so that paths below read "d/f"
         root->path = strdup(path);
+        size_t len = root->path ? strlen(root->path) : 0;
+        while (len > 1 && root->path[len - 1] == '/') {
+            root->path[--len] = '\0';
+        }
         root->fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     } else {
         // The directory part of the path is the operator's: it is opened
@@ -1254,14 +1498,14 @@ void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags,
                 root->fd = open(root->path, O_PATH | O_DIRECTORY | O_CLOEXEC);
             }
         }
-        name = root->rel;
         free(given);
         free(dir);
     }
 
-    // A -f root is only walked if it names a regular file in its directory
+    // A -f root is only watched if it names a regular file in its directory
     const char *error = NULL;
-    if (root->fd == -1 || !root->path || !name || !root->shown) {
+    if (root->fd == -1 || !root->path || !root->shown || (!S_ISDIR(path_stat.st_mode) &&
+                                                           !root->rel)) {
         error = strerror(errno);
     } else if (root->rel && fstatat(root->fd, root->rel, &path_stat, AT_SYMLINK_NOFOLLOW) != 0) {
         error = strerror(errno);
@@ -1281,39 +1525,34 @@ void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags,
         return;
     }
 
-    config->root_count++;
-    add_watches_walk(inotify_fd, root->fd, name, path, config->root_count - 1, flags, config, 0);
-}
-
-static int compare_ints(const void *a, const void *b) {
-    int x = *(const int *)a, y = *(const int *)b;
-    return (x > y) - (x < y);
-}
-
-// The watch descriptors of every file watch, in increasing order, in an array
-// to free; *count is set to their number. NULL if there are none or memory
-// runs out
-static int *file_watch_list(const watch_table *table, size_t *count) {
-    int *wds = table->count ? malloc(table->count * sizeof(*wds)) : NULL;
-    *count = 0;
-    if (!wds) {
-        return NULL;
+    int r = config->root_count++;
+    if (root->rel) {
+        watch_file_root(config, r, 0);
+    } else {
+        add_watches_walk(config, NULL, root->fd, ".", root->path, r, 0);
     }
-    for (size_t s = 0; s < table->size; s++) {
-        if (table->slots[s].wd >= 0 && !table->slots[s].is_dir) {
-            wds[(*count)++] = table->slots[s].wd;
+}
+
+// Every file entry, in an array to free; *count is set to their number. NULL
+// if there are none or memory runs out
+static file_entry **file_list(sqwatch_config *config, size_t *count) {
+    file_entry **files = config->files.count ? malloc(config->files.count * sizeof(*files)) :
+                                               NULL;
+    *count = 0;
+    for (size_t b = 0; files && b < config->files.size; b++) {
+        for (file_entry *f = config->files.buckets[b]; f; f = f->next) {
+            files[(*count)++] = f;
         }
     }
-    qsort(wds, *count, sizeof(*wds), compare_ints);
-    return wds;
+    return files;
 }
 
 // copy_file() as one of sqwatch's own reads
-static int copy_quietly(const sqwatch_config *config, const char *io_path, const char *cached,
-                        const char *path) {
-    own_reads(config, io_path, 1);
+static int copy_quietly(sqwatch_config *config, const dir_entry *dir, const char *io_path,
+                        const char *cached, const char *path) {
+    own_reads(config, dir, 1);
     int result = copy_file(io_path, cached, path);
-    own_reads(config, io_path, 0);
+    own_reads(config, dir, 0);
     return result;
 }
 
@@ -1321,47 +1560,45 @@ static int copy_quietly(const sqwatch_config *config, const char *io_path, const
 // there. Each file is opened beneath its root and read through that descriptor
 void cache_watched_files(sqwatch_config *config) {
     size_t count;
-    int *wds = file_watch_list(&config->watches, &count);
-    if (!wds && config->watches.count) {
+    file_entry **files = file_list(config, &count);
+    if (!files && config->files.count) {
         fprintf(stderr, RED "+ Out of memory, not caching the watched files\n" RESET);
     }
     for (size_t n = 0; n < count; n++) {
         stop_if_signalled();
-        watch_entry *entry = watch_find(&config->watches, wds[n]);
-        const char *path = entry->names[0].path;
-
-        const watch_root *root = &config->roots[entry->names[0].root];
-        struct stat st;
-        int fd = open_beneath(root->fd, rel_path(root, path), O_PATH);
-        if (fd == -1) {
-            fprintf(stderr, RED "+ Not caching %s: %s\n" RESET,
-                    shown_name(path), strerror(errno));
+        file_entry *f = files[n];
+        // One entry per inode: the names of a file with hard links share it
+        if (!f->inode || f->inode->names[0] != f) {
             continue;
         }
-        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
-            fprintf(stderr, RED "+ Not caching %s: no longer a regular file\n" RESET,
-                    shown_name(path));
-            close(fd);
+        char path[PATH_MAX];
+        if (!file_path(config, f, path, sizeof(path))) {
+            continue;
+        }
+        int fd = open_file(config, f);
+        if (fd == -1) {
+            fprintf(stderr, RED "+ Not caching %s: %s\n" RESET, shown_name(path),
+                    errno ? strerror(errno) : "no longer a regular file");
             continue;
         }
 
         // Every file gets an entry of its own, written now
         char io_path[FD_PATH_LEN];
-        if (entry->cached) {
-            unlink_cache_file(entry->cached);
-            free(entry->cached);
+        inode_node *node = f->inode;
+        if (node->cached) {
+            unlink_cache_file(node->cached);
+            free(node->cached);
         }
-        entry->cached = cache_new_entry(cache_dir);
-        if (entry->cached &&
-            copy_quietly(config, fd_path(fd, io_path, sizeof(io_path)), entry->cached, path) == 0 &&
-            config->verbose) {
-            printf(DARK_GREY "+ Cached [%d]: %s\n" RESET, wds[n], shown_name(path));
+        node->cached = cache_new_entry(cache_dir);
+        if (node->cached &&
+            copy_quietly(config, f->dir, fd_path(fd, io_path, sizeof(io_path)), node->cached,
+                         path) == 0 && config->verbose) {
+            printf(DARK_GREY "+ Cached: %s\n" RESET, shown_name(path));
         }
         close(fd);
     }
-    free(wds);
+    free(files);
 }
-
 
 // The grace a command gets to end after the stop signal on a restart; on
 // exit cleanup() gives it 5 s
@@ -1549,68 +1786,74 @@ static const char *describe(uint32_t mask) {
            mask & IN_IGNORED ? "Watch removed" : "Unknown";
 }
 
-// Note that the file watched by wd has events deferred: mask
-static void defer(sqwatch_config *config, watch_entry *entry, uint32_t mask) {
-    if (!entry->pending) {
-        if (config->pending_count == config->pending_size) {
-            size_t new_size = config->pending_size ? config->pending_size * 2 : 16;
-            int *grown = realloc(config->pending, new_size * sizeof(*grown));
-            if (!grown) {
-                fprintf(stderr, RED "+ Out of memory, a change may not be shown\n" RESET);
-                return;
-            }
-            config->pending = grown;
-            config->pending_size = new_size;
+// Note that the file f has events deferred: mask
+static void defer(sqwatch_config *config, file_entry *f, uint32_t mask) {
+    if (!f->pending_at) {
+        if (push_ptr((void ***)&config->pending, &config->pending_count, &config->pending_size,
+                     f) != 0) {
+            fprintf(stderr, RED "+ Out of memory, a change may not be shown\n" RESET);
+            return;
         }
-        config->pending[config->pending_count++] = entry->wd;
+        f->pending_at = config->pending_count;
     }
-    entry->pending |= mask;
+    f->pending |= mask;
 }
 
-// The file watched by wd changed: it is reached as path, read through
-// io_path. Say so unless quiet, run the command and diff the file. Each file
-// has a debounce window of its own: a change inside it, unless forced, is
-// deferred to when it closes, and then handled with any others that came
-// meanwhile, if the file changed since (see run_due()). A diff is made for a modification; mask IN_IGNORED stands for a
-// file found changed without an event of its own
-static void fire_file(event_loop *loop, int wd, const char *path, const char *io_path,
-                      uint32_t mask, int quiet, int force) {
+// The file f changed. Say so unless quiet, run the command and diff the file.
+// Each file has a debounce window of its own: a change inside it, unless
+// forced, is deferred to when it closes, and then handled with any others that
+// came meanwhile, if the file changed since (see run_due()). A diff is made
+// for a modification; mask IN_IGNORED stands for a file found changed without
+// an event of its own
+static void fire_file(event_loop *loop, file_entry *f, uint32_t mask, int quiet, int force) {
     sqwatch_config *config = loop->config;
-    watch_entry *entry = watch_find(&config->watches, wd);
-    if (!entry) {
+    if (!force && f->last_fire && loop->now - f->last_fire < loop->window) {
+        defer(config, f, mask);
         return;
     }
-    if (!force && entry->last_fire && loop->now - entry->last_fire < loop->window) {
-        defer(config, entry, mask);
+    char path[PATH_MAX];
+    if (!file_path(config, f, path, sizeof(path))) {
         return;
     }
-    mask |= entry->pending;
-    entry->pending = 0;
-    entry->last_fire = loop->now;
+    mask |= f->pending;
+    if (f->pending_at) {
+        file_entry *last = config->pending[--config->pending_count];
+        config->pending[f->pending_at - 1] = last;
+        last->pending_at = f->pending_at;
+        f->pending_at = 0;
+    }
+    f->pending = 0;
+    f->last_fire = loop->now;
+    int fd = open_file(config, f);
+    char io_path[FD_PATH_LEN];
     struct stat st;
-    if (stat(io_path, &st) == 0) {
-        entry->fired_ctime = st.st_ctim;
-        entry->fired_size = st.st_size;
+    if (fd != -1 && fstat(fd, &st) == 0) {
+        f->fired_ctime = st.st_ctim;
+        f->fired_size = st.st_size;
     }
     if (!quiet || (mask & ~IN_IGNORED)) {
         printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET, shown_name(path), describe(mask));
     }
     run_command(loop, path, event_name(mask));
 
-    if (cache_dir && config->diff_enabled && (mask & (IN_MODIFY | IN_IGNORED))) {
+    if (fd != -1 && cache_dir && config->diff_enabled && (mask & (IN_MODIFY | IN_IGNORED))) {
         stop_if_signalled();
         // A file without an entry (its copy failed) gets one now; run_diff()
         // then reports it as new
-        if (!entry->cached) {
-            entry->cached = cache_new_entry(cache_dir);
+        if (f->inode && !f->inode->cached) {
+            f->inode->cached = cache_new_entry(cache_dir);
         }
-        if (entry->cached) {
-            own_reads(config, io_path, 1);
-            run_diff(path, io_path, entry->cached, "Modified",
+        if (cache_of(f)) {
+            fd_path(fd, io_path, sizeof(io_path));
+            own_reads(config, f->dir, 1);
+            run_diff(path, io_path, cache_of(f), "Modified",
                      1, // diff is always verbose
                      config->log_file);
-            own_reads(config, io_path, 0);
+            own_reads(config, f->dir, 0);
         }
+    }
+    if (fd != -1) {
+        close(fd);
     }
 }
 
@@ -1619,45 +1862,38 @@ static void fire_file(event_loop *loop, int wd, const char *path, const char *io
 // if none is
 static int run_due(event_loop *loop) {
     sqwatch_config *config = loop->config;
-    long long next = -1;
-    size_t kept = 0;
+    long long next = departed_expire(0);
     loop->now = now_ms();
-    for (size_t i = 0; i < config->pending_count; i++) {
-        int wd = config->pending[i];
-        watch_entry *entry = watch_find(&config->watches, wd);
-        if (!entry || !entry->pending) {
-            continue;  // Dropped, or handled already
-        }
-        long long due = entry->last_fire + loop->window;
+    if (next >= 0) {
+        next += loop->now;
+    }
+    for (size_t i = 0; i < config->pending_count;) {
+        file_entry *f = config->pending[i];
+        long long due = f->last_fire + loop->window;
         if (due > loop->now) {
-            config->pending[kept++] = wd;
             next = next < 0 || due < next ? due : next;
+            i++;
             continue;
         }
-        int n;
-        int fd = open_entry(config, entry, &n);
-        char *path = fd == -1 ? NULL : strdup(entry->names[n].path);
+        int fd = open_file(config, f);
         struct stat st;
         // Events that came after the change was handled but belong to it (a
         // close after the write) leave nothing new to show
-        if (path && fstat(fd, &st) == 0 && st.st_size == entry->fired_size &&
-            st.st_ctim.tv_sec == entry->fired_ctime.tv_sec &&
-            st.st_ctim.tv_nsec == entry->fired_ctime.tv_nsec) {
-            free(path);
-            path = NULL;
-        }
-        if (path) {
-            char io_path[FD_PATH_LEN];
-            fire_file(loop, wd, path, fd_path(fd, io_path, sizeof(io_path)), entry->pending, 0, 1);
-        } else {
-            entry->pending = 0;  // Unchanged, or not reachable any more
-        }
-        free(path);
+        int same = fd == -1 || (fstat(fd, &st) == 0 && st.st_size == f->fired_size &&
+                                st.st_ctim.tv_sec == f->fired_ctime.tv_sec &&
+                                st.st_ctim.tv_nsec == f->fired_ctime.tv_nsec);
         if (fd != -1) {
             close(fd);
         }
+        if (same) {
+            config->pending[i] = config->pending[--config->pending_count];
+            config->pending[i]->pending_at = i + 1;
+            f->pending_at = 0;
+            f->pending = 0;
+            continue;
+        }
+        fire_file(loop, f, f->pending, 0, 1);  // takes f out of the list
     }
-    config->pending_count = kept;
     if (loop->rerun) {
         if (command_running()) {
             next = next < 0 || loop->now + 50 < next ? loop->now + 50 : next;
@@ -1681,238 +1917,367 @@ static int run_due(event_loop *loop) {
         return -1;
     }
     long long wait = next - loop->now;
-    return wait > 60000 ? 60000 : (int)wait;
+    return wait > 60000 ? 60000 : wait < 0 ? 0 : (int)wait;
 }
 
-// An event on the watch of a file. It is handled under the first of the
-// file's names that still leads to it. A name that leads nowhere now is
-// dropped; one that leads to another file (it was replaced, and no event of
-// the directory said so: a -f file, or the event was lost) gets that file
-// watched, which takes over the cache entry when no name is left here. When
-// no name leads to the file any more, its watch is dropped. IN_IGNORED says
-// the watch is gone: every name is then looked up again
-static void on_file_event(event_loop *loop, int wd, uint32_t mask) {
-    sqwatch_config *config = loop->config;
-    watch_entry *entry = watch_find(&config->watches, wd);
-    int gone = (mask & IN_IGNORED) != 0;
-    int found_fd = -1;
-    char *found = NULL;
-
-    // The names as they are now: the loop below may take them away
-    int count = entry->name_count;
-    watch_name *names = malloc(count * sizeof(*names));
-    if (!names) {
-        fprintf(stderr, RED "+ Out of memory handling an event\n" RESET);
-        return;
-    }
-    for (int n = 0; n < count; n++) {
-        names[n] = entry->names[n];
-        names[n].path = strdup(entry->names[n].path);
-    }
-
-    for (int n = 0; n < count; n++) {
-        if (!names[n].path) {
-            continue;
-        }
-        entry = watch_find(&config->watches, wd);
-        int k = 0;
-        while (entry && k < entry->name_count && strcmp(entry->names[k].path, names[n].path) != 0) {
-            k++;
-        }
-        if (!entry || k == entry->name_count) {
-            continue;  // Taken away meanwhile
-        }
-        int fd = open_name(config, entry, k, gone);
-        if (fd == -1) {
-            drop_name(loop->inotify_fd, config, names[n].path);
-        } else if (!gone && is_entry_file(fd, entry)) {
-            if (!found) {
-                found = names[n].path;
-                names[n].path = NULL;
-                found_fd = fd;
-                fd = -1;
-            }
-        } else {
-            // Another file has this name now, or this one lost its watch
-            int new_wd = add_watch_fd(loop->inotify_fd, fd, file_watch_mask(config->flags));
-            int added;
-            watch_entry *now = new_wd < 0 ? NULL :
-                attach_name(loop->inotify_fd, config, new_wd, fd, 0, names[n].path, names[n].root,
-                            &added);
-            if (now && !now->cached && config->diff_enabled && cache_dir) {
-                char io_path[FD_PATH_LEN];
-                fd_path(fd, io_path, sizeof(io_path));
-                own_reads(config, io_path, 1);
-                create_cache_for_file(names[n].path, io_path, cache_dir, &now->cached,
-                                      config->verbose);
-                own_reads(config, io_path, 0);
-            }
-            if (now && config->verbose) {
-                printf(DARK_GREY "+ Reapplied watch for %s\n" RESET, shown_name(names[n].path));
-            }
-            if (!now) {
-                drop_name(loop->inotify_fd, config, names[n].path);
-            }
-        }
-        if (fd != -1) {
-            close(fd);
-        }
-    }
-    for (int n = 0; n < count; n++) {
-        free(names[n].path);
-    }
-    free(names);
-
-    if (watch_find(&config->watches, wd) && (gone || !found)) {
-        // Nothing in the watched trees leads to this file any more
-        drop_watch(loop->inotify_fd, config, wd, gone, NULL);
-    }
-    if (found && (mask & config->flags)) {
-        char io_path[FD_PATH_LEN];
-        fire_file(loop, wd, found, fd_path(found_fd, io_path, sizeof(io_path)), mask, 0, 0);
-    }
-    if (found) {
-        close(found_fd);
-        free(found);
-    }
-}
-
-// Whether name in the directory dir_path (in root) is sqwatch's own log file
-// or cache directory
-static int is_own_file(sqwatch_config *config, int root, const char *dir_path, const char *name) {
-    const watch_root *top = &config->roots[root];
-    int dir_fd = open_beneath(top->fd, rel_path(top, dir_path), O_PATH | O_DIRECTORY);
+// Whether name in the directory dir_fd is sqwatch's own log file or cache
+// directory
+static int is_own_file(int dir_fd, const char *name) {
     int fd = dir_fd == -1 ? -1 : openat(dir_fd, name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
     int own = fd != -1 && (is_log_file(fd) || is_cache_dir(fd));
     if (fd != -1) {
         close(fd);
     }
-    if (dir_fd != -1) {
-        close(dir_fd);
-    }
     return own;
 }
 
-// An event on the watch of a directory: an entry was created, removed or moved
-// in or out of it. What comes in is watched (and cached, see watch_file());
-// what goes is dropped. The directory itself gone (IN_IGNORED) takes what is
-// beneath it along
-static void on_dir_event(event_loop *loop, int wd, const struct inotify_event *event,
-                         const struct inotify_event *next) {
-    sqwatch_config *config = loop->config;
-    watch_entry *entry = watch_find(&config->watches, wd);
-    char dir_path[PATH_MAX];
-    char full_path[PATH_MAX];
-    int dir_root = entry->names[0].root;
-    snprintf(dir_path, sizeof(dir_path), "%s", entry->names[0].path);
-
-    if (event->mask & IN_IGNORED) {
-        drop_tree(loop->inotify_fd, config, dir_path);
-        drop_watch(loop->inotify_fd, config, wd, 1, NULL);
-        return;
+// Whether dir watches name: every name of a walked directory, only the -f
+// names of a directory watched for -f files
+static int dir_watches_name(const dir_entry *dir, const char *name) {
+    if (dir->full) {
+        return 1;
     }
-    if (event->len == 0 || !(event->mask & DIR_WATCH_EVENTS)) {
-        return;
-    }
-    if (snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, event->name) >= (int)sizeof(full_path)) {
-        fprintf(stderr, RED "+ Path too long, skipping event\n" RESET);
-        return;
-    }
-
-    // Nothing about an ignored entry is shown, and it is never watched
-    if (is_ignored(config, dir_root, full_path) || is_own_file(config, dir_root, dir_path,
-                                                                 event->name)) {
-        return;
-    }
-
-    uint32_t asked = event->mask & config->flags & DIR_WATCH_EVENTS;
-    int exists = 1;
-    // A file renamed within the watched trees keeps its old name for now:
-    // whatever is made under it next (an editor that moves the file aside to
-    // write a new one) takes over its cache entry. The name goes once it is
-    // found to lead nowhere. The rename is the next event, with the same
-    // cookie
-    int renamed = (event->mask & IN_MOVED_FROM) && !(event->mask & IN_ISDIR) && next &&
-                  (next->mask & IN_MOVED_TO) && next->cookie == event->cookie;
-    if ((event->mask & (IN_DELETE | IN_MOVED_FROM)) && !renamed) {
-        if (event->mask & IN_ISDIR) {
-            drop_tree(loop->inotify_fd, config, full_path);
-        } else {
-            drop_name(loop->inotify_fd, config, full_path);
+    for (int i = 0; i < dir->only_count; i++) {
+        if (strcmp(dir->only[i], name) == 0) {
+            return 1;
         }
-    } else if (event->mask & (IN_CREATE | IN_MOVED_TO)) {
-        // Reach the directory from its root without following symlinks
-        // and look at the new entry relative to that descriptor
-        const watch_root *root = &config->roots[dir_root];
-        int dir_fd = open_beneath(root->fd, rel_path(root, dir_path), O_PATH | O_DIRECTORY);
-        struct stat path_stat;
-        exists = dir_fd != -1 && fstatat(dir_fd, event->name, &path_stat, AT_SYMLINK_NOFOLLOW) == 0;
-        if (exists && S_ISLNK(path_stat.st_mode)) {
-            if (config->verbose) {
-                printf(DARK_GREY "+ Skipping symlink %s\n" RESET, shown_name(full_path));
+    }
+    return 0;
+}
+
+// The root of the entry name in dir: a -f file's own root, else dir's
+static int root_of(const sqwatch_config *config, const dir_entry *dir, const char *name) {
+    if (!dir->full) {
+        for (int r = 0; r < config->root_count; r++) {
+            if (config->roots[r].rel && strcmp(config->roots[r].rel, name) == 0 &&
+                strcmp(config->roots[r].path, dir->path) == 0) {
+                return r;
             }
-        } else if (exists) {
-            config->creating = (event->mask & IN_CREATE) != 0;
-            add_watches_walk(loop->inotify_fd, dir_fd, event->name, full_path, dir_root,
-                             config->flags, config, 2);
-            config->creating = 0;
+        }
+    }
+    return dir->root;
+}
+
+// The entry `name` of dir came into the tree (created, or moved in from
+// outside). A directory is walked, a file watched and cached. A file that
+// replaces one watched under that name keeps that name's cache entry and is
+// diffed against it
+static void entry_arrived(event_loop *loop, dir_entry *dir, int dir_fd, const char *name,
+                          const char *path) {
+    sqwatch_config *config = loop->config;
+    struct stat st;
+    if (dir_fd == -1 || fstatat(dir_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        return;
+    }
+    if (S_ISLNK(st.st_mode)) {
+        if (config->verbose) {
+            printf(DARK_GREY "+ Skipping symlink %s\n" RESET, shown_name(path));
+        }
+        return;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        if (dir->full) {
+            add_watches_walk(config, dir, dir_fd, name, path, dir->root, 2);
+        }
+        return;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        return;
+    }
+    file_entry *f = file_find(config, dir, name);
+    if (f) {
+        // Replaced: the cache entry holds what the name showed before
+        file_set_inode(config, f, st.st_dev, st.st_ino, 1);
+        f->seen = config->scan;
+        mark_changed(config, f, config->creating ? CHANGED_CREATED : CHANGED_TAKEOVER);
+        return;
+    }
+    watch_file(config, dir, dir_fd, name, path, root_of(config, dir, name), 2);
+}
+
+// The entry `name` of dir left it (removed, or moved out of the tree)
+static void entry_left(sqwatch_config *config, dir_entry *dir, const char *name, int moved) {
+    dir_entry *sub = dir_child(config, dir, name);
+    if (sub) {
+        dir_drop(config, sub, 0);
+        return;
+    }
+    file_entry *f = file_find(config, dir, name);
+    if (!f) {
+        return;
+    }
+    if (config->verbose) {
+        char path[PATH_MAX];
+        printf(DARK_GREY "+ File no longer exists: %s\n" RESET,
+               shown_name(file_path(config, f, path, sizeof(path)) ?: name));
+    }
+    if (moved && f->inode && f->inode->count == 1 && f->inode->cached) {
+        // An editor may make a new file under the name in a moment
+        departed_add(dir, name, NULL, take_history(config, f));
+    }
+    file_free(config, f);
+}
+
+// The entry from_name of from was renamed to to_name in to, both watched
+// directories. A file keeps its cache entry and its events; one that
+// replaces a watched file there is diffed against the cache entry of that
+// name, which keeps it. A directory keeps its watches, its files and their
+// caches; only the paths beneath it change
+static void entry_renamed(event_loop *loop, dir_entry *from, const char *from_name,
+                          dir_entry *to, int to_fd, const char *to_name, const char *to_path) {
+    sqwatch_config *config = loop->config;
+    dir_entry *sub = dir_child(config, from, from_name);
+    if (sub) {
+        if (!to->full || is_ignored(config, to->root, to_path)) {
+            dir_drop(config, sub, 0);
+        } else if (dir_reparent(config, sub, to, to_name) == 0) {
+            dir_repath(sub, to_path);
+        } else {
+            dir_drop(config, sub, 0);
+        }
+        return;
+    }
+    file_entry *f = file_find(config, from, from_name);
+    if (!f) {
+        // Not watched where it was (ignored, or a -f directory's other
+        // name): as if it came from outside
+        if (dir_watches_name(to, to_name) && !is_ignored(config, to->root, to_path) &&
+            !is_own_file(to_fd, to_name)) {
+            entry_arrived(loop, to, to_fd, to_name, to_path);
+        }
+        return;
+    }
+    if (!dir_watches_name(to, to_name) || is_ignored(config, root_of(config, to, to_name), to_path)) {
+        entry_left(config, from, from_name, 1);
+        return;
+    }
+    file_entry *there = file_find(config, to, to_name);
+    if (there) {
+        // The name keeps its history; the file that moved there is diffed
+        // against it
+        dev_t dev = f->inode ? f->inode->dev : 0;
+        ino_t ino = f->inode ? f->inode->ino : 0;
+        file_free(config, f);
+        if (dev || ino) {
+            file_set_inode(config, there, dev, ino, 1);
+        }
+        mark_changed(config, there, CHANGED_TAKEOVER);
+        return;
+    }
+    if (file_rename(config, f, to, to_name) == 0) {
+        f->root = root_of(config, to, to_name);
+        departed_add(from, from_name, f, NULL);
+    }
+}
+
+// An event on the watch of a directory dir: about an entry in it, named, or
+// about dir itself. Entries that come in are watched (and cached, see
+// watch_file()), those that go are dropped, renames keep what was known. next
+// is the event after this one in the buffer, if any: a rename is two events
+// with the same cookie. Returns 1 if next was handled here as well
+static int on_dir_event(event_loop *loop, dir_entry *dir, const struct inotify_event *event,
+                        const struct inotify_event *next) {
+    sqwatch_config *config = loop->config;
+    char full_path[PATH_MAX];
+
+    if (event->len == 0) {
+        if (event->mask & IN_IGNORED) {
+            dir_drop(config, dir, 1);  // Gone, and with it all beneath it
+        } else if ((event->mask & (IN_MOVE_SELF | IN_DELETE_SELF)) && !dir->full) {
+            // The directory of a -f file was moved or removed: look for the
+            // file where its path leads now
+            for (int r = 0; r < config->root_count; r++) {
+                watch_root *root = &config->roots[r];
+                if (root->rel && strcmp(root->path, dir->path) == 0 && reopen_file_root(root)) {
+                    file_entry *old = file_find(config, dir, root->rel);
+                    char *history = old ? take_history(config, old) : NULL;
+                    if (old) {
+                        file_free(config, old);
+                    }
+                    watch_file_root(config, r, 1);
+                    dir_entry *now = dir_find(config, add_watch_fd(config->inotify_fd, root->fd,
+                                                                   dir_watch_mask(config->flags)));
+                    file_entry *f = now ? file_find(config, now, root->rel) : NULL;
+                    if (f && give_history(f, history)) {
+                        mark_changed(config, f, CHANGED_TAKEOVER);
+                    } else if (!f && history) {
+                        unlink_cache_file(history);
+                        free(history);
+                    }
+                }
+            }
+        }
+        return 0;  // Reads of the directory itself are not reported
+    }
+    const char *name = event->name;
+    if (!dir_watches_name(dir, name)) {
+        return 0;
+    }
+    if (snprintf(full_path, sizeof(full_path), "%s/%s", dir->path, name) >= (int)sizeof(full_path)) {
+        fprintf(stderr, RED "+ Path too long, skipping event\n" RESET);
+        return 0;
+    }
+    int root = root_of(config, dir, name);
+    const char *shown = config->roots[root].rel ? config->roots[root].shown : full_path;
+    uint32_t mask = event->mask;
+    int dir_fd = open_dir(config, dir);
+    int consumed = 0;
+
+    // Nothing about an ignored entry, or sqwatch's own log and cache, is
+    // shown, and it is never watched
+    if (is_ignored(config, root, full_path) ||
+        (!(mask & (IN_DELETE | IN_MOVED_FROM)) && is_own_file(dir_fd, name))) {
+        if ((mask & IN_MOVED_FROM) && next && (next->mask & IN_MOVED_TO) &&
+            next->cookie == event->cookie) {
+            // Moved from an ignored name to a watched one: it arrives there
+            dir_entry *to = dir_find(config, next->wd);
+            char to_path[PATH_MAX];
+            if (to && next->len && dir_watches_name(to, next->name) &&
+                snprintf(to_path, sizeof(to_path), "%s/%s", to->path, next->name) <
+                    (int)sizeof(to_path)) {
+                consumed = 1;
+                int to_fd = open_dir(config, to);
+                if (!is_ignored(config, to->root, to_path) && !is_own_file(to_fd, next->name)) {
+                    entry_arrived(loop, to, to_fd, next->name, to_path);
+                    if (config->flags & IN_MOVED_TO) {
+                        printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET, shown_name(to_path),
+                               describe(IN_MOVED_TO));
+                        run_command(loop, to_path, event_name(IN_MOVED_TO));
+                    }
+                }
+                if (to_fd != -1) {
+                    close(to_fd);
+                }
+            }
         }
         if (dir_fd != -1) {
             close(dir_fd);
         }
+        return consumed;
     }
 
-    // Directory watches always carry DIR_WATCH_EVENTS to follow the tree;
-    // only run the command for the events that were asked for. Each of them
-    // is shown; command runs are coalesced (see run_command())
-    if (asked && exists) {
-        printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET, shown_name(full_path), describe(asked));
-        run_command(loop, full_path, event_name(asked));
+    if (mask & (IN_CREATE | IN_MOVED_TO)) {
+        config->creating = (mask & IN_CREATE) != 0;
+        entry_arrived(loop, dir, dir_fd, name, full_path);
+        config->creating = 0;
+        file_entry *f = (mask & IN_CREATE) ? file_find(config, dir, name) : NULL;
+        if (f) {
+            f->fresh = 1;  // Made empty: its close is no change until it is written
+        }
+    } else if (mask & IN_DELETE) {
+        if (!(mask & IN_ISDIR)) {
+            entry_left(config, dir, name, 0);
+        }
+        // A directory goes with the IN_IGNORED of its own watch
+    } else if (mask & IN_MOVED_FROM) {
+        dir_entry *to = next && (next->mask & IN_MOVED_TO) && next->cookie == event->cookie &&
+                        next->len ? dir_find(config, next->wd) : NULL;
+        char to_path[PATH_MAX];
+        if (to && snprintf(to_path, sizeof(to_path), "%s/%s", to->path, next->name) <
+                      (int)sizeof(to_path)) {
+            consumed = 1;
+            int to_fd = to == dir ? dup(dir_fd) : open_dir(config, to);
+            entry_renamed(loop, dir, name, to, to_fd, next->name, to_path);
+            if (to_fd != -1) {
+                close(to_fd);
+            }
+        } else {
+            entry_left(config, dir, name, 1);
+        }
+    } else if (!(mask & IN_ISDIR)) {
+        // What happened to the file: written, read, attributes
+        file_entry *f = file_find(config, dir, name);
+        if (f && (mask & IN_MODIFY)) {
+            f->fresh = 0;
+        } else if (f && f->fresh && (mask & IN_CLOSE_WRITE)) {
+            mask &= ~IN_CLOSE_WRITE;  // A file made and closed unwritten, as by touch
+        }
+        if (!f && (mask & config->flags)) {
+            f = watch_file(config, dir, dir_fd, name, full_path, root, 1);
+        }
+        if (f && (mask & config->flags)) {
+            fire_file(loop, f, mask, 0, 0);
+        }
     }
+
+    // Only the events asked for run the command. Each of them is shown;
+    // command runs are coalesced (see run_command())
+    uint32_t asked = mask & config->flags & (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO);
+    if (asked) {
+        printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET, shown_name(shown), describe(asked));
+        run_command(loop, shown, event_name(asked));
+    }
+    if (consumed && (config->flags & IN_MOVED_TO)) {
+        dir_entry *to = dir_find(config, next->wd);
+        char to_path[PATH_MAX];
+        if (to && snprintf(to_path, sizeof(to_path), "%s/%s", to->path, next->name) <
+                      (int)sizeof(to_path)) {
+            printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET, shown_name(to_path),
+                   describe(IN_MOVED_TO));
+            run_command(loop, to_path, event_name(IN_MOVED_TO));
+        }
+    }
+    if (dir_fd != -1) {
+        close(dir_fd);
+    }
+    return consumed;
 }
 
 // Events were lost: walk every root again. New files and directories are
-// watched and cached, names that were not found again are dropped, and every
-// file whose content differs from its cache entry is marked changed. Without
-// a cache what changed is not known: the command is run
+// watched and cached, what was not found again is dropped, and every file
+// whose content differs from its cache entry is marked changed. Without a
+// cache what changed is not known: the command is run
 static void rescan(event_loop *loop) {
     sqwatch_config *config = loop->config;
     config->scan++;
+    departed_expire(1);
     for (int r = 0; r < config->root_count; r++) {
         watch_root *root = &config->roots[r];
         if (root->rel) {
             reopen_file_root(root);
+            watch_file_root(config, r, 1);
+        } else {
+            add_watches_walk(config, NULL, root->fd, ".", root->path, r, 1);
         }
-        add_watches_walk(loop->inotify_fd, root->fd, root->rel ? root->rel : ".", root->shown, r,
-                         config->flags, config, 1);
     }
 
-    char **stale = NULL;
-    size_t count = 0, size = 0;
-    for (size_t s = 0; s < config->watches.size; s++) {
-        const watch_entry *entry = &config->watches.slots[s];
-        for (int n = 0; entry->wd >= 0 && n < entry->name_count; n++) {
-            if (entry->names[n].seen == config->scan) {
-                continue;
-            }
-            if (count == size) {
-                size_t new_size = size ? size * 2 : 64;
-                char **grown = realloc(stale, new_size * sizeof(*grown));
+    // What was not found again: files first, then whole directories
+    size_t count, steps = 0;
+    file_entry **files = file_list(config, &count);
+    for (size_t i = 0; i < count; i++) {
+        if ((++steps & 255) == 0) {
+            stop_if_signalled();
+        }
+        if (files[i]->seen != config->scan) {
+            file_free(config, files[i]);
+            files[i] = NULL;
+        }
+    }
+    free(files);
+    int *stale = NULL;
+    size_t stale_count = 0, stale_size = 0;
+    for (size_t b = 0; b < config->dirs.size; b++) {
+        for (dir_entry *d = config->dirs.buckets[b]; d; d = d->next) {
+            if (d->seen != config->scan && stale_count == stale_size) {
+                size_t new_size = stale_size ? stale_size * 2 : 16;
+                int *grown = realloc(stale, new_size * sizeof(*grown));
                 if (!grown) {
                     break;
                 }
                 stale = grown;
-                size = new_size;
+                stale_size = new_size;
             }
-            stale[count] = strdup(entry->names[n].path);
-            if (stale[count]) {
-                count++;
+            if (d->seen != config->scan) {
+                stale[stale_count++] = d->wd;
             }
         }
     }
-    for (size_t i = 0; i < count; i++) {
-        drop_name(loop->inotify_fd, config, stale[i]);
-        free(stale[i]);
+    // By wd: a stale directory beneath another stale one is gone with it
+    for (size_t i = 0; i < stale_count; i++) {
+        dir_entry *d = dir_find(config, stale[i]);
+        if (d) {
+            dir_drop(config, d, 0);
+        }
     }
     free(stale);
 
@@ -1920,95 +2285,82 @@ static void rescan(event_loop *loop) {
         run_command(loop, "", "overflow");
         return;
     }
-    size_t files;
-    int *wds = file_watch_list(&config->watches, &files);
-    for (size_t i = 0; i < files; i++) {
-        watch_entry *entry = watch_find(&config->watches, wds[i]);
-        if (!entry->cached || entry->changed) {
-            continue;
+    files = file_list(config, &count);
+    for (size_t i = 0; i < count; i++) {
+        stop_if_signalled();
+        file_entry *f = files[i];
+        if (!cache_of(f) || f->changed_at || f->inode->names[0] != f) {
+            continue;  // One check per inode
         }
-        int n;
-        int fd = open_entry(config, entry, &n);
+        int fd = open_file(config, f);
         char io_path[FD_PATH_LEN];
         int differs = 0;
         if (fd != -1) {
             fd_path(fd, io_path, sizeof(io_path));
-            own_reads(config, io_path, 1);
-            differs = cache_differs(io_path, entry->cached);
-            own_reads(config, io_path, 0);
-        }
-        if (differs) {
-            mark_changed(config, wds[i], CHANGED_RESCAN);
-        }
-        if (fd != -1) {
+            own_reads(config, f->dir, 1);
+            differs = cache_differs(io_path, cache_of(f));
+            own_reads(config, f->dir, 0);
             close(fd);
         }
+        if (differs) {
+            mark_changed(config, f, CHANGED_RESCAN);
+        }
     }
-    free(wds);
+    free(files);
 }
 
-// Diff the files marked changed, under the first name that leads to them. One that took over
-// the cache entry of a name it replaced is diffed without a trigger line, as
-// a rearmed watch always was; one a rescan found changed is reported
+// Diff the files marked changed. One that took over the cache entry of a name
+// it replaced is diffed without a trigger line, as a rearmed watch always
+// was; one a rescan found changed is reported
 static void diff_changed(event_loop *loop) {
     sqwatch_config *config = loop->config;
-    for (size_t i = 0; i < config->changed_count; i++) {
-        watch_entry *entry = watch_find(&config->watches, config->changed[i]);
-        if (!entry) {
-            continue;
+    while (config->changed_count > 0) {
+        file_entry *f = config->changed[0];
+        int why = f->changed;
+        config->changed[0] = config->changed[--config->changed_count];
+        if (config->changed_count) {
+            config->changed[0]->changed_at = 1;
         }
-        int why = entry->changed;
-        entry->changed = 0;
-        int n;
-        int fd = open_entry(config, entry, &n);
+        f->changed_at = 0;
+        f->changed = 0;
+        int fd = open_file(config, f);
+        struct stat st;
         if (fd == -1) {
             continue;
         }
-        char *path = strdup(entry->names[n].path);
-        char io_path[FD_PATH_LEN];
-        struct stat st;
         // A file just created may not be written yet: the write, which its
-        // watch now sees, is diffed then
+        // directory's watch now sees, is diffed then
         int unwritten = why == CHANGED_CREATED && fstat(fd, &st) == 0 && st.st_size == 0;
-        if (path && !unwritten) {
-            fire_file(loop, config->changed[i], path, fd_path(fd, io_path, sizeof(io_path)),
-                      why == CHANGED_RESCAN ? IN_MODIFY : IN_IGNORED, why != CHANGED_RESCAN, 1);
-        }
-        free(path);
         close(fd);
+        if (!unwritten) {
+            fire_file(loop, f, why == CHANGED_RESCAN ? IN_MODIFY : IN_IGNORED,
+                      why != CHANGED_RESCAN, 1);
+        }
     }
-    config->changed_count = 0;
 }
 
 // The configuration handle_events() and watched_path() work on
 static sqwatch_config *events_config;
 
-// The displayed path of the watched regular file dev/ino, by the first of
-// its names that leads to it, or NULL. Good until the next call
+// The displayed path of the watched regular file dev/ino, or NULL. Good until
+// the next call
 const char *watched_path(dev_t dev, ino_t ino) {
     static char path[PATH_MAX];
     sqwatch_config *config = events_config;
-    if (!config || config->inodes.size == 0) {
+    if (!config) {
         return NULL;
     }
-    inode_slot *slot = inode_slot_of(&config->inodes, dev, ino);
-    watch_entry *entry = slot->wd < 0 ? NULL : watch_find(&config->watches, slot->wd);
-    int n;
-    int fd = entry ? open_entry(config, entry, &n) : -1;
-    if (fd < 0) {
-        return NULL;
-    }
-    close(fd);
-    snprintf(path, sizeof(path), "%s", entry->names[n].path);
-    return path;
+    inode_node *n = inode_find(config, dev, ino);
+    return n && n->count ? file_path(config, n->names[0], path, sizeof(path)) : NULL;
 }
 
 // Handle inotify events until SIGINT, SIGTERM or SIGHUP is read from
 // signal_fd, and return that signal; SIGTERM if the events cannot be read
 int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
-    char buffer[BUF_LEN];
+    char buffer[BUF_LEN] __attribute__((aligned(__alignof__(struct inotify_event))));
     event_loop loop = {inotify_fd, config, 0, config->debounce_ms, 0, 0, 0, 0, NULL, NULL};
     events_config = config;
+    int reported_failure = 0;
 
     while (1) {
         // stdout is polled for an error only: its reader went away. With -p
@@ -2017,6 +2369,16 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
         struct pollfd fds[5] = {{inotify_fd, POLLIN, 0}, {signal_fd, POLLIN, 0},
                                 {STDOUT_FILENO, 0, 0}, {perm_wake_fd(), POLLIN, 0},
                                 {perm_decider_fd(), POLLIN, 0}};
+        if (config->watch_failed != reported_failure) {
+            // Part of the tree is not watched: like lost events. The message
+            // is shown once (see watch_failed()); each new failure runs the
+            // command again
+            reported_failure = config->watch_failed;
+            loop.now = now_ms();
+            printf(CYAN "+ Trigger on %s: [ %s ]\n" RESET, "(watch limit)", "Queue overflow");
+            run_command(&loop, "", "overflow");
+            flush_command(&loop);
+        }
         int timeout = run_due(&loop);
         if (perm_active()) {
             int perm_timeout = perm_work();
@@ -2071,11 +2433,9 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
                     rescan(&loop);
                 }
             } else {
-                watch_entry *watched = watch_find(&config->watches, event->wd);
-                if (watched && watched->is_dir) {
-                    on_dir_event(&loop, event->wd, event, next);
-                } else if (watched) {
-                    on_file_event(&loop, event->wd, event->mask);
+                dir_entry *dir = dir_find(config, event->wd);
+                if (dir && on_dir_event(&loop, dir, event, next) && next) {
+                    i += EVENT_SIZE + next->len;  // The other half of a rename
                 }
             }
             diff_changed(&loop);
@@ -2090,7 +2450,8 @@ void print_usage(void) {
            "\n"
            "Watch:\n"
            "  -d DIR         Directory to watch, with everything beneath it (repeatable)\n"
-           "  -f FILE        File to watch (repeatable)\n"
+           "  -f FILE        File to watch (repeatable), through its directory: it is\n"
+           "                 followed when it is deleted and made again\n"
            "  -q EVENTS      Events to react to, separated by commas (default: modify):\n"
            "                   modify   a file was written\n"
            "                   create   a file or directory was created\n"
@@ -2114,8 +2475,9 @@ void print_usage(void) {
            "                 COMMAND gets the change in its environment: SQWATCH_PATH,\n"
            "                 the path, and SQWATCH_EVENT: modify, create, delete, move,\n"
            "                 attrib, open, access (overflow, with an empty path, after\n"
-           "                 lost events). Use them quoted, as \"$SQWATCH_PATH\". When\n"
-           "                 changes come together, one run is made, for the latest of them\n"
+           "                 lost events or a failed watch). Use them quoted, as\n"
+           "                 \"$SQWATCH_PATH\". When changes come together, one run is made,\n"
+           "                 for the latest of them\n"
            "  -w             Wait for a run still going to end instead of stopping it;\n"
            "                 the changes that come meanwhile lead to one more run after it\n"
            "  -s SIGNAL      Signal that stops a run: a name, with or without SIG, or a\n"

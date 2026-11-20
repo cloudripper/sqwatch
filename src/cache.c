@@ -1115,6 +1115,37 @@ char *cache_new_entry(const char *cache_dir) {
   return entry;
 }
 
+// A new cache entry holding what the entry src holds (a size and time record
+// stays one). Returns its path, to free, or NULL
+char *cache_copy_entry(const char *cache_dir, const char *src) {
+  char *entry = cache_new_entry(cache_dir);
+  int in = entry ? open_cache_file(src, O_RDONLY) : -1;
+  int out = in < 0 ? -1 : open_cache_file(entry, O_WRONLY | O_TRUNC);
+  struct stat st;
+  int ok = out >= 0 && fstat(in, &st) == 0;
+  char buffer[65536];
+  ssize_t n;
+  while (ok && (n = read(in, buffer, sizeof(buffer))) > 0) {
+    ok = write(out, buffer, n) == n;
+    stop_if_signalled();
+  }
+  if (ok && !(st.st_mode & S_IWUSR)) {
+    ok = fchmod(out, 0400) == 0;
+  }
+  if (in >= 0) {
+    close(in);
+  }
+  if (out >= 0) {
+    close(out);
+  }
+  if (!ok && entry) {
+    unlink_cache_file(entry);
+    free(entry);
+    entry = NULL;
+  }
+  return entry;
+}
+
 // Write the watched file path, read through io_path, into its cache entry
 // *cached_path. A file that has an entry already (the watch descriptor is the
 // same: another name for the same file) keeps it and it is written again;

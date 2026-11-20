@@ -63,9 +63,11 @@ Basic syntax:
 sqwatch -d DIR | -f FILE [options]
 ```
 
+How files are watched: sqwatch watches directories, one inotify watch each, and sees what happens to the files in them through those watches, by name. A `-f FILE` is watched through the watch of its directory, limited to that name, so it is still followed when it is deleted and made again, or replaced by an editor. Each name of a file with hard links is a file of its own; a change made through a name outside the watched trees is not seen. When a watch cannot be set (for example, the inotify watch limit `fs.inotify.max_user_watches` is reached), sqwatch says so once, loudly, and runs the command as after lost events (`SQWATCH_EVENT=overflow`): what is beneath that directory is not seen.
+
 Watch:
 - `-d DIR`: Directory to watch, with everything beneath it (repeatable)
-- `-f FILE`: File to watch (repeatable)
+- `-f FILE`: File to watch (repeatable), through its directory: it is followed when it is deleted and made again
 - `-q EVENTS`: Events to react to, separated by commas, for example `-q modify,create` (default: `modify`)
   - `modify`: a file was written
   - `create`: a file or directory was created
@@ -76,7 +78,7 @@ Watch:
   - `access`: a file was read
   - `all`: all of the above but `open` and `access`
 
-  sqwatch's own reads of the watched files (the copies and diffs of `--diff`, its checks, and the walk after lost events) never count as `open` or `access`: while sqwatch reads a file, the watch of that file leaves out read events, so the kernel queues none for that read. A process that reads the same file in that moment is not seen either. The command's reads do count: a command that reads a file watched with `-q open` starts itself again, debounce after debounce. Keep what the command reads out of the watched trees, or out of the watch with `-i`
+  sqwatch's own reads of the watched files (the copies and diffs of `--diff`, its checks, and the walk after lost events) never count as `open` or `access`: while sqwatch reads a file, the watch of its directory leaves out read events, so the kernel queues none for that read. A process that reads a file of the same directory in that moment is not seen either. The command's reads do count: a command that reads a file watched with `-q open` starts itself again, debounce after debounce. Keep what the command reads out of the watched trees, or out of the watch with `-i`
 - `-i PATTERN`: Ignore what matches PATTERN (repeatable). An ignored directory is not watched and not walked; an ignored file never triggers the command, is never diffed and never cached. PATTERN is a shell pattern (see `fnmatch(3)`). A PATTERN with a `/` is matched against the path below the watched directory (`/` is only matched by `/`), any other against the name alone; a trailing `/` is dropped. For example `-i '*.o' -i build/tmp`. Always ignored: `.git`, and sqwatch's own log file and cache directory when they are inside a watched tree. Ignores apply at startup, to entries created or moved in later, and when the tree is walked again after lost events
 
 Command:
@@ -85,7 +87,7 @@ Command:
 - `-s SIGNAL`: Signal that stops a run, on a restart and when sqwatch exits: a name, with or without `SIG`, in any case (`TERM`, `sigint`, `RTMIN+2`), or a number (default: `TERM`). What is left of the run's process group gets `KILL` 2 s later on a restart, 5 s later (or at a second signal to sqwatch) on exit. `STOP`, `TSTP`, `TTIN` and `TTOU` are refused, as they would pause the command instead of stopping it, and so is `CONT`, which stops nothing
 - The command gets the change that started it in its environment, never in the command string:
   - `SQWATCH_PATH`: the path of the file or directory, as sqwatch shows it (relative to the `-d` or `-f` path given), byte for byte
-  - `SQWATCH_EVENT`: `modify`, `create`, `delete`, `move`, `attrib`, `open` or `access`; `overflow`, with an empty `SQWATCH_PATH`, when events were lost and the tree was walked again without `--diff`
+  - `SQWATCH_EVENT`: `modify`, `create`, `delete`, `move`, `attrib`, `open` or `access`; `overflow`, with an empty `SQWATCH_PATH`, when events were lost and the tree was walked again without `--diff`, or when a directory could not be watched
 
   Quote them: `sqwatch -d src -c 'echo "changed: $SQWATCH_PATH ($SQWATCH_EVENT)"'`. When changes come together (in one batch of events, or inside the debounce window of the last run), they lead to one run, and that run gets the latest of them.
 - `-t SECONDS`: Debounce time of each file, a decimal number of seconds such as `2` or `0.25`, from 0 to 86400 (default: 1, or 0 in observe mode)
