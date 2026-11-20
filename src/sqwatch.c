@@ -120,8 +120,9 @@ static const char *option_help(int opt) {
                    "  access, all, separated by commas, for example -q modify,create";
   case 'l': return "-l FILE: the log file for diffs (with --diff)";
   case 'p': return "-p EVENTS: one or more of open, access, exec, separated by commas";
-  case 'T': return "-T TIMEOUT: SECONDS, deny, or SECONDS:deny; SECONDS is a decimal number\n"
-                   "  above 0 and up to 86400, for example 5 or 0.5 (default: 5, then allow)";
+  case 'T': return "-T TIMEOUT: SECONDS, deny, allow, SECONDS:deny or SECONDS:allow; SECONDS is\n"
+                   "  a decimal number above 0 and up to 86400, for example 5 or 0.5\n"
+                   "  (default: 5, then deny)";
   case 's': return "-s SIGNAL: a name, with or without SIG, in any case, or a number:\n"
                    "  HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM\n"
                    "  STKFLT CHLD URG XCPU XFSZ VTALRM PROF WINCH IO PWR SYS,\n"
@@ -309,19 +310,20 @@ static uint64_t parse_perm_events(const char *list, const char **problem) {
   }
 }
 
-// -T: SECONDS, deny, or SECONDS:deny (SECONDS:allow says the default)
-static int parse_perm_timeout(const char *text, long long *ms, int *deny) {
+// -T: SECONDS, allow, deny, SECONDS:allow or SECONDS:deny. What is not
+// decided is denied (deny says the default); allow lets it through
+static int parse_perm_timeout(const char *text, long long *ms, int *allow) {
   char seconds[32];
   const char *colon = strchr(text, ':');
-  *deny = 0;
-  if (strcmp(text, "deny") == 0) {
-    *deny = 1;
+  *allow = 0;
+  if (strcmp(text, "deny") == 0 || strcmp(text, "allow") == 0) {
+    *allow = text[0] == 'a';
     return 0;
   }
   if (colon) {
-    if (strcmp(colon + 1, "deny") == 0) {
-      *deny = 1;
-    } else if (strcmp(colon + 1, "allow") != 0) {
+    if (strcmp(colon + 1, "allow") == 0) {
+      *allow = 1;
+    } else if (strcmp(colon + 1, "deny") != 0) {
       return -1;
     }
   }
@@ -430,7 +432,7 @@ int main(int argc, char *argv[]) {
   uint32_t flags = 0;
   uint64_t perm_mask = 0;
   long long perm_timeout_ms = 5000;
-  int perm_deny = 0, perm_timeout_set = 0;
+  int perm_allow = 0, perm_timeout_set = 0;
 
   int inotify_fd = -1;
   config.roots = calloc(argc, sizeof(*config.roots));
@@ -527,14 +529,15 @@ int main(int argc, char *argv[]) {
       break;
     case 'p': {
       const char *problem = NULL;
-      perm_mask = parse_perm_events(optarg, &problem);
-      if (!perm_mask) {
+      uint64_t asked = parse_perm_events(optarg, &problem);
+      if (!asked) {
         bad_value('p', optarg, problem);
       }
+      perm_mask |= asked;
       break;
     }
     case 'T':
-      if (parse_perm_timeout(optarg, &perm_timeout_ms, &perm_deny) != 0) {
+      if (parse_perm_timeout(optarg, &perm_timeout_ms, &perm_allow) != 0) {
         bad_value('T', optarg, "not a timeout");
       }
       perm_timeout_set = 1;
@@ -614,7 +617,7 @@ int main(int argc, char *argv[]) {
     printf(GREEN "+ Asking %s before every%s%s%s of the watched files (%s s, then %s)\n" RESET,
            shown_name(command), perm_mask & FAN_OPEN_PERM ? " open" : "",
            perm_mask & FAN_ACCESS_PERM ? " read" : "", perm_mask & FAN_OPEN_EXEC_PERM ? " exec" : "",
-           format_seconds(perm_timeout_ms), perm_deny ? "deny" : "allow");
+           format_seconds(perm_timeout_ms), perm_allow ? "allow" : "deny");
   }
   if (flags) {
     announce_events(flags);
@@ -699,7 +702,7 @@ int main(int argc, char *argv[]) {
 
   // Marks are set by the walk
   if (perm_mask) {
-    perm_start(perm_mask, perm_timeout_ms, perm_deny, command, watched_path);
+    perm_start(perm_mask, perm_timeout_ms, perm_allow, command, watched_path);
   }
 
   for (int i = 0; i < path_count; i++) {
@@ -708,6 +711,9 @@ int main(int argc, char *argv[]) {
 
   if (cache_dir && config.diff_enabled) {
     cache_watched_files(&config);
+  }
+  if (perm_mask) {
+    perm_ready();
   }
 
   cleanup(handle_events(inotify_fd, signal_fd, &config));

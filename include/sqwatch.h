@@ -57,6 +57,7 @@ struct dir_entry {
     int root;                // Index into roots
     int full;                // Walked: every entry in it counts. Otherwise it
                              // is the directory of -f files only (see only)
+    int quiet;               // Ignored, watched only to be marked for -p
     char **only;             // -f: the names in it that are watched
     int only_count;
     dev_t dev;

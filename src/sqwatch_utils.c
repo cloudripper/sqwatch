@@ -495,6 +495,18 @@ static void inode_leave(sqwatch_config *config, file_entry *f) {
     if (!n) {
         return;
     }
+    // Only f's own place in the list is taken: the entry there must be f
+    if (f->inode_at >= n->count || n->names[f->inode_at] != f) {
+        size_t i = 0;
+        while (i < n->count && n->names[i] != f) {
+            i++;
+        }
+        if (i == n->count) {
+            f->inode = NULL;
+            return;
+        }
+        f->inode_at = i;
+    }
     file_entry *last = n->names[--n->count];
     n->names[f->inode_at] = last;
     last->inode_at = f->inode_at;
@@ -1069,9 +1081,10 @@ static file_entry *watch_file(sqwatch_config *config, dir_entry *dir, int dir_fd
     }
     char io_path[FD_PATH_LEN];
     fd_path(fd, io_path, sizeof(io_path));
-    // A directory's mark covers its files; a -f file is marked on its own
-    if (perm_active() && config->roots[root].rel) {
-        perm_mark(io_path, 0);
+    // A directory's mark covers its files while they are in it; each file is
+    // marked on its own as well, so that it stays gated when moved out
+    if (perm_active()) {
+        perm_mark(io_path, 0, path);
     }
     if (added && at_runtime) {
         take_departed(config, f);
@@ -1127,6 +1140,10 @@ static dir_entry *watch_dir(sqwatch_config *config, int dir_fd, const char *path
                 dir_repath(dir, path);
             }
         }
+        if (full && !dir->full && perm_active()) {
+            char io_path[FD_PATH_LEN];
+            perm_mark(fd_path(dir_fd, io_path, sizeof(io_path)), 1, path);
+        }
         dir->full |= full;
         dir->seen = config->scan;
         return dir;
@@ -1153,9 +1170,12 @@ static dir_entry *watch_dir(sqwatch_config *config, int dir_fd, const char *path
         dir_drop(config, dir, 0);
         return NULL;
     }
-    if (perm_active()) {
+    // A walked directory is marked: its mark covers the files in it. The
+    // directory of -f files is not: only those files are gated, each by the
+    // mark of its own
+    if (perm_active() && full) {
         char io_path[FD_PATH_LEN];
-        perm_mark(fd_path(dir_fd, io_path, sizeof(io_path)), 1);
+        perm_mark(fd_path(dir_fd, io_path, sizeof(io_path)), 1, path);
     }
     if (config->verbose) {
         printf(CYAN "+ Watch set for directory %s\n" RESET, shown_name(path));
@@ -1240,7 +1260,7 @@ static int read_names(sqwatch_config *config, int fd, char *path, int root, int 
             }
             if (type == DT_LNK && config->verbose) {
                 printf(DARK_GREY "+ Skipping symlink %s\n" RESET, shown_name(path));
-            } else if (type == DT_REG) {
+            } else if (type == DT_REG && !level->dir->quiet) {
                 watch_file(config, level->dir, fd, name, path, root, at_runtime);
             }
             path[len] = '\0';
@@ -1279,8 +1299,10 @@ static int enter_dir(sqwatch_config *config, int fd, char *path, dir_entry *pare
                      size_t *depth, size_t *size) {
     struct stat st;
     // An ignored directory, or sqwatch's own cache, is neither watched nor
-    // walked
-    if (is_ignored(config, root, path) || is_cache_dir(fd)) {
+    // walked. With -p an ignored directory is watched and walked all the
+    // same, quietly, so that it is marked: nothing in it is reported
+    int quiet = (parent && parent->quiet) || is_ignored(config, root, path);
+    if ((quiet && !config->perm) || is_cache_dir(fd)) {
         if (config->verbose) {
             printf(DARK_GREY "+ Ignoring %s\n" RESET, shown_name(path));
         }
@@ -1306,6 +1328,7 @@ static int enter_dir(sqwatch_config *config, int fd, char *path, dir_entry *pare
     if (!dir) {
         return 0;  // Without a watch nothing beneath it would be seen
     }
+    dir->quiet = quiet;
     walk_level *level = &(*levels)[*depth];
     *level = (walk_level){NULL, 0, 0, st.st_dev, st.st_ino, strlen(path), dir};
     if (read_names(config, fd, path, root, at_runtime, level) != 0) {
@@ -2120,7 +2143,16 @@ static void entry_arrived(event_loop *loop, dir_entry *dir, int dir_fd, const ch
     }
     file_entry *f = file_find(config, dir, name);
     if (f) {
-        // Replaced: the cache entry holds what the name showed before
+        // Replaced: the cache entry holds what the name showed before. The
+        // new file is marked on its own, as the old one was
+        if (perm_active()) {
+            int fd = open_file_at(dir_fd, name);
+            char io_path[FD_PATH_LEN];
+            if (fd != -1) {
+                perm_mark(fd_path(fd, io_path, sizeof(io_path)), 0, path);
+                close(fd);
+            }
+        }
         file_set_inode(config, f, st.st_dev, st.st_ino, 1);
         f->seen = config->scan;
         mark_changed(config, f, config->creating ? CHANGED_CREATED : CHANGED_TAKEOVER);
@@ -2165,8 +2197,13 @@ static void entry_renamed(event_loop *loop, dir_entry *from, const char *from_na
     sqwatch_config *config = loop->config;
     dir_entry *sub = dir_child(config, from, from_name);
     if (sub) {
-        if (!to->full || is_ignored(config, to->root, to_path)) {
+        int quiet = to->quiet || is_ignored(config, to->root, to_path);
+        if (!to->full || quiet || sub->quiet) {
+            // Walked again, if at all, as what it is now (see enter_dir())
             dir_drop(config, sub, 0);
+            if (to->full && (!quiet || config->perm) && to_fd != -1) {
+                add_watches_walk(config, to, to_fd, to_name, to_path, to->root, 1);
+            }
         } else if (dir_reparent(config, sub, to, to_name) == 0) {
             dir_repath(sub, to_path);
         } else {
@@ -2178,13 +2215,14 @@ static void entry_renamed(event_loop *loop, dir_entry *from, const char *from_na
     if (!f) {
         // Not watched where it was (ignored, or a -f directory's other
         // name): as if it came from outside
-        if (dir_watches_name(to, to_name) && !is_ignored(config, to->root, to_path) &&
+        if (dir_watches_name(to, to_name) && !to->quiet && !is_ignored(config, to->root, to_path) &&
             !is_own_file(to_fd, to_name)) {
             entry_arrived(loop, to, to_fd, to_name, to_path);
         }
         return;
     }
-    if (!dir_watches_name(to, to_name) || is_ignored(config, root_of(config, to, to_name), to_path)) {
+    if (!dir_watches_name(to, to_name) || to->quiet ||
+        is_ignored(config, root_of(config, to, to_name), to_path)) {
         entry_left(config, from, from_name, 1);
         return;
     }
@@ -2263,6 +2301,30 @@ static int on_dir_event(event_loop *loop, dir_entry *dir, const struct inotify_e
     uint32_t mask = event->mask;
     int dir_fd = open_dir(config, dir);
     int consumed = 0;
+
+    // With -p an ignored directory is still watched, and walked, so that it
+    // is marked (see enter_dir()); nothing in it is reported
+    if (config->perm && (mask & IN_ISDIR) &&
+        (dir->quiet || is_ignored(config, root, full_path))) {
+        dir_entry *sub = dir_child(config, dir, name);
+        if (mask & (IN_DELETE | IN_MOVED_FROM)) {
+            if (sub) {
+                dir_drop(config, sub, 0);
+            }
+        } else if ((mask & (IN_CREATE | IN_MOVED_TO)) && dir_fd != -1 && !is_own_file(dir_fd, name)) {
+            add_watches_walk(config, dir, dir_fd, name, full_path, dir->root, 1);
+        }
+        if (dir_fd != -1) {
+            close(dir_fd);
+        }
+        return 0;
+    }
+    if (dir->quiet) {
+        if (dir_fd != -1) {
+            close(dir_fd);
+        }
+        return 0;
+    }
 
     // Nothing about an ignored entry, or sqwatch's own log and cache, is
     // shown, and it is never watched
@@ -2694,13 +2756,16 @@ void print_usage(void) {
            "  -p EVENTS      Hold each open, read or exec of the watched files until\n"
            "                 COMMAND (-c) decides: exit status 0 allows it, any other\n"
            "                 denies it (EPERM). EVENTS: open, access, exec, separated by\n"
-           "                 commas. COMMAND also gets SQWATCH_PID, the process opening\n"
-           "                 the file. One COMMAND runs at a time; sqwatch's own reads\n"
-           "                 and COMMAND's own process group are always allowed. Not\n"
-           "                 with -q; --diff still shows what is written\n"
+           "                 commas. A gate that fails closed: what is not allowed in\n"
+           "                 time, or cannot be asked, is denied. COMMAND gets the file\n"
+           "                 as its descriptor 3: check /dev/fd/3, never the path\n"
+           "                 (SQWATCH_PATH only informs), and SQWATCH_PID, the opener.\n"
+           "                 If sqwatch is killed (KILL, crash, OOM) the kernel lets\n"
+           "                 everything through. Ignored files are gated too. Not with\n"
+           "                 -q; --diff still shows what is written. See the README\n"
            "  -T TIMEOUT     Time COMMAND has to decide: SECONDS (default: 5), then the\n"
-           "                 access is allowed and COMMAND killed; deny or SECONDS:deny\n"
-           "                 to deny it then instead\n"
+           "                 access is denied and COMMAND killed; allow or SECONDS:allow\n"
+           "                 to allow it then instead (fails open)\n"
            "\n"
            "Diff:\n"
            "  --diff         Show what changed in each file, from a private cache (a file\n"

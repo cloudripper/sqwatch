@@ -5,16 +5,18 @@
 #include <sys/types.h>
 
 // -p: opens, reads or execs of the watched files wait for the command to
-// allow or deny them (fanotify permission events)
+// allow or deny them (fanotify permission events). What is not decided is
+// denied, unless -T says allow
 
 // Path of the watched regular file dev/ino, as sqwatch shows it, or NULL if
 // it is not watched
 typedef const char *(*perm_lookup)(dev_t dev, ino_t ino);
 
-void perm_start(uint64_t mask, long long timeout_ms, int deny_on_timeout, const char *command,
+void perm_start(uint64_t mask, long long timeout_ms, int allow, const char *command,
                 perm_lookup lookup);
 int perm_active(void);
-void perm_mark(const char *io_path, int is_dir);
+void perm_ready(void);
+void perm_mark(const char *io_path, int is_dir, const char *shown);
 int perm_wake_fd(void);
 int perm_decider_fd(void);
 int perm_work(void);
