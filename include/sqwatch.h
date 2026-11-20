@@ -86,8 +86,24 @@ typedef struct {
     size_t count;
 } name_index;
 
+// Every watched inode, to its watch descriptor: open addressing with linear
+// probing (for -p, which is told about a file by its inode)
+typedef struct {
+    dev_t dev;
+    ino_t ino;
+    int wd;                  // -1 marks a free slot
+} inode_slot;
+
+typedef struct {
+    inode_slot *slots;
+    size_t size;
+    size_t count;
+} inode_index;
+
 typedef struct {
     watch_table watches;
+    inode_index inodes;
+    int perm;                // -p: the command decides opens, nothing else
     int inotify_fd;
     name_index names;
     unsigned scan;           // Rescans so far
@@ -126,6 +142,7 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config);
 void print_usage(void);
 watch_entry *watch_find(watch_table *table, int wd);
 watch_entry *watch_add(watch_table *table, int wd);
+const char *watched_path(dev_t dev, ino_t ino);
 void stop_if_signalled(void);
 void stop_if_output_closed(void);
 const char *printable(const char *path, char *buf, size_t size);

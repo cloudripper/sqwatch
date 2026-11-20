@@ -1,13 +1,13 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -g -I./include
-SRCS = src/sqwatch.c src/sqwatch_utils.c src/diff.c src/cache.c
+CFLAGS = -Wall -Wextra -g -I./include -pthread
+SRCS = src/sqwatch.c src/sqwatch_utils.c src/diff.c src/cache.c src/permission.c
 OBJS = $(SRCS:.c=.o)
 TARGET = sqwatch
 
 all: $(TARGET)
 	
 $(TARGET): $(OBJS)
-	$(CC) $(OBJS) -o $(TARGET)
+	$(CC) $(OBJS) -o $(TARGET) -pthread
 	
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

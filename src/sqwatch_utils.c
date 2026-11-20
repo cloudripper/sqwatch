@@ -23,6 +23,7 @@
 #include "cache.h"
 #include "sqwatch.h"
 #include "diff.h"
+#include "permission.h"
 
 
 // Room for "/proc/self/fd/" followed by any int
@@ -294,6 +295,9 @@ static const char *fd_path(int fd, char *buf, size_t size) {
 // into one by the kernel (it merges an event with the same one queued just
 // before it)
 static uint32_t file_watch_mask(uint32_t flags) {
+    if (!flags) {
+        return IN_DELETE_SELF | IN_MOVE_SELF;  // -p alone: the file is only followed
+    }
     return flags | (flags & (IN_OPEN | IN_ACCESS) ? IN_CLOSE_WRITE | IN_CLOSE_NOWRITE : 0);
 }
 
@@ -469,6 +473,68 @@ static int open_entry(sqwatch_config *config, const watch_entry *entry, int *n) 
     return -1;
 }
 
+static size_t inode_hash(dev_t dev, ino_t ino) {
+  return (size_t)(((uint64_t)ino * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)dev * 0xC2B2AE3D27D4EB4Full));
+}
+
+// The slot of dev/ino in the inode index, or the free slot where it would go
+static inode_slot *inode_slot_of(const inode_index *index, dev_t dev, ino_t ino) {
+  size_t mask = index->size - 1;
+  for (size_t s = inode_hash(dev, ino) & mask;; s = (s + 1) & mask) {
+    inode_slot *slot = &index->slots[s];
+    if (slot->wd < 0 || (slot->dev == dev && slot->ino == ino)) {
+      return slot;
+    }
+  }
+}
+
+static void inode_put(inode_index *index, dev_t dev, ino_t ino, int wd) {
+  if ((index->count + 1) * 4 > index->size * 3) {
+    size_t new_size = index->size ? index->size * 2 : 64;
+    inode_slot *slots = malloc(new_size * sizeof(*slots));
+    if (!slots) {
+      return;
+    }
+    for (size_t s = 0; s < new_size; s++) {
+      slots[s].wd = -1;
+    }
+    inode_index grown = {slots, new_size, index->count};
+    for (size_t s = 0; s < index->size; s++) {
+      if (index->slots[s].wd >= 0) {
+        *inode_slot_of(&grown, index->slots[s].dev, index->slots[s].ino) = index->slots[s];
+      }
+    }
+    free(index->slots);
+    *index = grown;
+  }
+  inode_slot *slot = inode_slot_of(index, dev, ino);
+  if (slot->wd < 0) {
+    index->count++;
+  }
+  *slot = (inode_slot){dev, ino, wd};
+}
+
+static void inode_del(inode_index *index, dev_t dev, ino_t ino) {
+  if (index->size == 0) {
+    return;
+  }
+  size_t mask = index->size - 1;
+  inode_slot *slot = inode_slot_of(index, dev, ino);
+  if (slot->wd < 0) {
+    return;
+  }
+  size_t hole = (size_t)(slot - index->slots);
+  for (size_t s = (hole + 1) & mask; index->slots[s].wd >= 0; s = (s + 1) & mask) {
+    size_t home = inode_hash(index->slots[s].dev, index->slots[s].ino) & mask;
+    if (((s - home) & mask) >= ((s - hole) & mask)) {
+      index->slots[hole] = index->slots[s];
+      hole = s;
+    }
+  }
+  index->slots[hole].wd = -1;
+  index->count--;
+}
+
 static size_t hash_path(const char *path) {
   size_t h = 14695981039346656037u;
   for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
@@ -574,6 +640,9 @@ static void drop_watch(int inotify_fd, sqwatch_config *config, int wd, int watch
   while (entry->name_count > 0) {
     remove_name(config, entry, entry->name_count - 1);
   }
+  if (!entry->is_dir) {
+    inode_del(&config->inodes, entry->dev, entry->ino);
+  }
   watch_remove(&config->watches, entry);
 }
 
@@ -677,6 +746,9 @@ static watch_entry *attach_name(int inotify_fd, sqwatch_config *config, int wd, 
     if (fstat(fd, &st) == 0) {
       entry->dev = st.st_dev;
       entry->ino = st.st_ino;
+      if (!is_dir) {
+        inode_put(&config->inodes, st.st_dev, st.st_ino, wd);
+      }
     }
     entry->is_dir = is_dir;
   }
@@ -800,6 +872,11 @@ static void watch_file(int inotify_fd, int parent_fd, const char *name, const ch
     int added = 0;
     watch_entry *entry = wd < 0 ? NULL :
         attach_name(inotify_fd, config, wd, fd, 0, path, root, &added);
+    // A directory's mark covers its files; a -f file is marked on its own
+    if (entry && perm_active() && config->roots[root].rel) {
+        char io_path[FD_PATH_LEN];
+        perm_mark(fd_path(fd, io_path, sizeof(io_path)), 0);
+    }
     if (entry && at_runtime && config->diff_enabled && cache_dir && !entry->cached) {
         char io_path[FD_PATH_LEN];
         fd_path(fd, io_path, sizeof(io_path));
@@ -824,6 +901,10 @@ static void watch_dir(int inotify_fd, int dir_fd, const char *path, int root, ui
                       sqwatch_config *config) {
     int wd = add_watch_fd(inotify_fd, dir_fd, dir_watch_mask(flags));
     int added = 0;
+    if (wd >= 0 && perm_active()) {
+        char io_path[FD_PATH_LEN];
+        perm_mark(fd_path(dir_fd, io_path, sizeof(io_path)), 1);
+    }
     // A directory watched before (walked again, or reached by another name)
     // gets the wd it already has: its entry is updated
     if (wd >= 0 && attach_name(inotify_fd, config, wd, dir_fd, 1, path, root, &added) &&
@@ -1397,6 +1478,9 @@ static long long now_ms(void) {
 // to one run, made by flush_command() once the buffer is done; the run gets
 // the latest of them
 static void run_command(event_loop *loop, const char *path, const char *event) {
+    if (loop->config->perm) {
+        return;  // With -p the command only decides permission events
+    }
     char *copy = strdup(path);
     if (copy) {
         free(loop->command_path);
@@ -1896,19 +1980,53 @@ static void diff_changed(event_loop *loop) {
     config->changed_count = 0;
 }
 
+// The configuration handle_events() and watched_path() work on
+static sqwatch_config *events_config;
+
+// The displayed path of the watched regular file dev/ino, by the first of
+// its names that leads to it, or NULL. Good until the next call
+const char *watched_path(dev_t dev, ino_t ino) {
+    static char path[PATH_MAX];
+    sqwatch_config *config = events_config;
+    if (!config || config->inodes.size == 0) {
+        return NULL;
+    }
+    inode_slot *slot = inode_slot_of(&config->inodes, dev, ino);
+    watch_entry *entry = slot->wd < 0 ? NULL : watch_find(&config->watches, slot->wd);
+    int n;
+    int fd = entry ? open_entry(config, entry, &n) : -1;
+    if (fd < 0) {
+        return NULL;
+    }
+    close(fd);
+    snprintf(path, sizeof(path), "%s", entry->names[n].path);
+    return path;
+}
+
 // Handle inotify events until SIGINT, SIGTERM or SIGHUP is read from
 // signal_fd, and return that signal; SIGTERM if the events cannot be read
 int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
     char buffer[BUF_LEN];
     event_loop loop = {inotify_fd, config, 0, config->debounce_ms, 0, 0, 0, 0, NULL, NULL};
+    events_config = config;
 
     while (1) {
-        // stdout is polled for an error only: its reader went away
-        struct pollfd fds[3] = {{inotify_fd, POLLIN, 0}, {signal_fd, POLLIN, 0},
-                                {STDOUT_FILENO, 0, 0}};
+        // stdout is polled for an error only: its reader went away. With -p
+        // the events the reader thread queued and the end of the command
+        // deciding one wake the loop too
+        struct pollfd fds[5] = {{inotify_fd, POLLIN, 0}, {signal_fd, POLLIN, 0},
+                                {STDOUT_FILENO, 0, 0}, {perm_wake_fd(), POLLIN, 0},
+                                {perm_decider_fd(), POLLIN, 0}};
         int timeout = run_due(&loop);
+        if (perm_active()) {
+            int perm_timeout = perm_work();
+            fds[4].fd = perm_decider_fd();
+            if (perm_timeout >= 0 && (timeout < 0 || perm_timeout < timeout)) {
+                timeout = perm_timeout;
+            }
+        }
         stop_if_output_closed();
-        if (poll(fds, 3, timeout) == -1) {
+        if (poll(fds, perm_active() ? 5 : 3, timeout) == -1) {
             if (errno == EINTR) {
                 continue;
             }
@@ -1992,7 +2110,12 @@ void print_usage(void) {
            "Command:\n"
            "  -c COMMAND     Run COMMAND with /bin/sh -c on each change; a run still going\n"
            "                 is stopped and started again. Without -c sqwatch only shows\n"
-           "                 events and diffs (observe mode), with no debounce unless -t\n"
+           "                 events and diffs (observe mode), with no debounce unless -t.\n"
+           "                 COMMAND gets the change in its environment: SQWATCH_PATH,\n"
+           "                 the path, and SQWATCH_EVENT: modify, create, delete, move,\n"
+           "                 attrib, open, access (overflow, with an empty path, after\n"
+           "                 lost events). Use them quoted, as \"$SQWATCH_PATH\". When\n"
+           "                 changes come together, one run is made, for the latest of them\n"
            "  -w             Wait for a run still going to end instead of stopping it;\n"
            "                 the changes that come meanwhile lead to one more run after it\n"
            "  -s SIGNAL      Signal that stops a run: a name, with or without SIG, or a\n"
@@ -2000,12 +2123,19 @@ void print_usage(void) {
            "                 2 s later on a restart, 5 s later when sqwatch exits\n"
            "  -t SECONDS     Debounce time of each file, a decimal number (default: 1,\n"
            "                 or 0 without -c)\n"
-           "                 The command gets the change in its environment: SQWATCH_PATH,\n"
-           "                 the path, and SQWATCH_EVENT: modify, create, delete, move,\n"
-           "                 attrib, open, access (overflow, with an empty path, after\n"
-           "                 lost events).\n"
-           "                 Use them quoted, as \"$SQWATCH_PATH\". When changes come\n"
-           "                 together, one run is made, for the latest of them\n"
+
+           "\n"
+           "Intercept (fanotify, needs CAP_SYS_ADMIN):\n"
+           "  -p EVENTS      Hold each open, read or exec of the watched files until\n"
+           "                 COMMAND (-c) decides: exit status 0 allows it, any other\n"
+           "                 denies it (EPERM). EVENTS: open, access, exec, separated by\n"
+           "                 commas. COMMAND also gets SQWATCH_PID, the process opening\n"
+           "                 the file. One COMMAND runs at a time; sqwatch's own reads\n"
+           "                 and COMMAND's own process group are always allowed. Not\n"
+           "                 with -q; --diff still shows what is written\n"
+           "  -T TIMEOUT     Time COMMAND has to decide: SECONDS (default: 5), then the\n"
+           "                 access is allowed and COMMAND killed; deny or SECONDS:deny\n"
+           "                 to deny it then instead\n"
            "\n"
            "Diff:\n"
            "  --diff         Show what changed in each file, from a private cache\n"

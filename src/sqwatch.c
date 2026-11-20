@@ -1,6 +1,7 @@
 #include "cache.h"
 #include "diff.h"
 #include "sqwatch.h"
+#include "permission.h"
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -11,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/fanotify.h>
 #include <sys/inotify.h>
 #include <sys/prctl.h>
 #include <sys/signalfd.h>
@@ -33,6 +35,8 @@ static int signal_fd = -1;
 // signal, or 5 s, and it is killed
 static void cleanup(int signo) {
   (void)signo;
+  // No process may be left waiting for an answer from sqwatch
+  perm_shutdown();
   printf(RED "\n+ Exiting SQWatch... \n" RESET);
 
   // Remove this run's cache entries, and the cache directory if this run
@@ -115,6 +119,9 @@ static const char *option_help(int opt) {
   case 'q': return "-q EVENTS: one or more of modify, create, delete, move, attrib, open,\n"
                    "  access, all, separated by commas, for example -q modify,create";
   case 'l': return "-l FILE: the log file for diffs (with --diff)";
+  case 'p': return "-p EVENTS: one or more of open, access, exec, separated by commas";
+  case 'T': return "-T TIMEOUT: SECONDS, deny, or SECONDS:deny; SECONDS is a decimal number\n"
+                   "  above 0 and up to 86400, for example 5 or 0.5 (default: 5, then allow)";
   case 's': return "-s SIGNAL: a name, with or without SIG, in any case, or a number:\n"
                    "  HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM\n"
                    "  STKFLT CHLD URG XCPU XFSZ VTALRM PROF WINCH IO PWR SYS,\n"
@@ -268,6 +275,55 @@ static int parse_signal(const char *text, const char **problem) {
   return signo;
 }
 
+// The fanotify permission events of a -p list. Returns 0 and sets *problem
+// if a name is not known
+static uint64_t parse_perm_events(const char *list, const char **problem) {
+  static char why[64];
+  uint64_t mask = 0;
+  const char *p = list;
+  while (1) {
+    size_t len = strcspn(p, ",");
+    uint64_t one = len == 4 && strncmp(p, "open", 4) == 0 ? FAN_OPEN_PERM :
+                   len == 6 && strncmp(p, "access", 6) == 0 ? FAN_ACCESS_PERM :
+                   len == 4 && strncmp(p, "exec", 4) == 0 ? FAN_OPEN_EXEC_PERM : 0;
+    if (!one) {
+      snprintf(why, sizeof(why), "'%.*s' is not one of them", len > 32 ? 32 : (int)len, p);
+      *problem = len ? shown_name(why) : "an empty name";
+      return 0;
+    }
+    mask |= one;
+    if (p[len] == '\0') {
+      return mask;
+    }
+    p += len + 1;
+  }
+}
+
+// -T: SECONDS, deny, or SECONDS:deny (SECONDS:allow says the default)
+static int parse_perm_timeout(const char *text, long long *ms, int *deny) {
+  char seconds[32];
+  const char *colon = strchr(text, ':');
+  *deny = 0;
+  if (strcmp(text, "deny") == 0) {
+    *deny = 1;
+    return 0;
+  }
+  if (colon) {
+    if (strcmp(colon + 1, "deny") == 0) {
+      *deny = 1;
+    } else if (strcmp(colon + 1, "allow") != 0) {
+      return -1;
+    }
+  }
+  size_t len = colon ? (size_t)(colon - text) : strlen(text);
+  if (len >= sizeof(seconds)) {
+    return -1;
+  }
+  memcpy(seconds, text, len);
+  seconds[len] = '\0';
+  return parse_seconds(seconds, ms) != 0 || *ms == 0 ? -1 : 0;
+}
+
 // The inotify events of a -q list: names separated by commas. Returns 0 and
 // sets *problem if a name is not known or the list is empty
 static uint32_t parse_events(const char *list, const char **problem) {
@@ -362,6 +418,9 @@ int main(int argc, char *argv[]) {
   char *log_file = NULL;
   int verbose = 0;
   uint32_t flags = 0;
+  uint64_t perm_mask = 0;
+  long long perm_timeout_ms = 5000;
+  int perm_deny = 0, perm_timeout_set = 0;
 
   int inotify_fd = -1;
   config.roots = calloc(argc, sizeof(*config.roots));
@@ -386,7 +445,7 @@ int main(int argc, char *argv[]) {
   // Errors are reported here, not by getopt: a leading ':' tells a missing
   // argument from an unknown option
   opterr = 0;
-  while ((opt = getopt_long(argc, argv, ":d:f:t:q:c:l:i:s:wvh", long_options, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, ":d:f:t:q:c:l:i:s:p:T:wvh", long_options, NULL)) != -1) {
     struct stat statbuf;
     switch (opt) {
     case 'd':
@@ -456,6 +515,20 @@ int main(int argc, char *argv[]) {
     case 'w':
       config.wait = 1;
       break;
+    case 'p': {
+      const char *problem = NULL;
+      perm_mask = parse_perm_events(optarg, &problem);
+      if (!perm_mask) {
+        bad_value('p', optarg, problem);
+      }
+      break;
+    }
+    case 'T':
+      if (parse_perm_timeout(optarg, &perm_timeout_ms, &perm_deny) != 0) {
+        bad_value('T', optarg, "not a timeout");
+      }
+      perm_timeout_set = 1;
+      break;
     case 's': {
       const char *problem = NULL;
       stop_signal = parse_signal(optarg, &problem);
@@ -492,7 +565,27 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "sqwatch: -l needs --diff: the log holds the diffs\nsee sqwatch -h\n");
     exit(EXIT_FAILURE);
   }
-  if (!flags) {
+  if (perm_timeout_set && !perm_mask) {
+    fprintf(stderr, "sqwatch: -T needs -p: it is the time the command has to decide\nsee sqwatch -h\n");
+    exit(EXIT_FAILURE);
+  }
+  if (perm_mask) {
+    if (!command) {
+      fprintf(stderr, "sqwatch: -p needs -c: the command decides, exit status 0 allows\nsee sqwatch -h\n");
+      exit(EXIT_FAILURE);
+    }
+    if (flags) {
+      fprintf(stderr, "sqwatch: -p and -q do not go together: with -p the command decides opens\n"
+                      "and runs for nothing else\nsee sqwatch -h\n");
+      exit(EXIT_FAILURE);
+    }
+    if (config.wait) {
+      fprintf(stderr, "sqwatch: warning: -w has no effect with -p\n");
+    }
+    // Writes are still followed, for --diff; they run nothing
+    config.perm = 1;
+    flags = config.diff_enabled ? IN_MODIFY | IN_CLOSE_WRITE : 0;
+  } else if (!flags) {
     flags = IN_MODIFY | IN_CLOSE_WRITE;  // -q modify
   }
   if (!command) {
@@ -507,7 +600,15 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "sqwatch: warning: -s has no effect without -c\n");
     }
   }
-  announce_events(flags);
+  if (perm_mask) {
+    printf(GREEN "+ Asking %s before every%s%s%s of the watched files (%s s, then %s)\n" RESET,
+           shown_name(command), perm_mask & FAN_OPEN_PERM ? " open" : "",
+           perm_mask & FAN_ACCESS_PERM ? " read" : "", perm_mask & FAN_OPEN_EXEC_PERM ? " exec" : "",
+           format_seconds(perm_timeout_ms), perm_deny ? "deny" : "allow");
+  }
+  if (flags) {
+    announce_events(flags);
+  }
   if (!command) {
     printf(DARK_GREY "+ No command (-c): showing events only\n" RESET);
   }
@@ -584,6 +685,11 @@ int main(int argc, char *argv[]) {
     // Diffs would read and write files under that path: do not diff at all
     config.diff_enabled = 0;
     fprintf(stderr, RED "+ Diff disabled: cache directory %s cannot be used\n" RESET, shown_name(cache_dir));
+  }
+
+  // Marks are set by the walk
+  if (perm_mask) {
+    perm_start(perm_mask, perm_timeout_ms, perm_deny, command, watched_path);
   }
 
   for (int i = 0; i < path_count; i++) {

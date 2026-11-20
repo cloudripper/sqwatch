@@ -92,6 +92,18 @@ Command:
 
 sqwatch writes its output a line at a time, whether to a terminal, a pipe or a file, and flushes it before it starts the command, so that its lines and the command's stay in order and none is written twice.
 
+Intercept (fanotify; needs the `CAP_SYS_ADMIN` capability, that is, root):
+- `-p EVENTS`: Hold each `open`, `access` (read) or `exec` of the watched files, separated by commas, until the command (`-c`, required) decides: exit status 0 allows it, any other status denies it, and the opener gets `EPERM`. The command gets `SQWATCH_PATH`, `SQWATCH_EVENT` (`open`, `access` or `exec`) and `SQWATCH_PID`, the process that opens the file. For example, to keep everything but `less` out of a key:
+  ```bash
+  sudo sqwatch -f secret.key -p open -c '[ "$(cat /proc/$SQWATCH_PID/comm)" = less ]'
+  ```
+  - One command runs at a time; up to 256 events wait their turn, and an event beyond that is allowed with a warning, rather than holding the system up.
+  - sqwatch's own reads (with `--diff`) and every process in the command's process group are always allowed, so neither can wait on itself.
+  - Only the watched files and directories are marked (a directory's mark covers the files in it), never a mount or a filesystem, and the marks follow new and moved-in files and directories as the watches do. A file that is ignored (`-i`), or not seen yet, is allowed. A marked file that left the watched trees keeps its mark until sqwatch exits, and its opens are allowed at once.
+  - Every held access gets an answer: allowed if anything goes wrong, and on exit (SIGINT, SIGTERM, SIGHUP) every access still waiting is allowed before anything else; if sqwatch is killed outright, the kernel allows them.
+  - `-p` does not go with `-q`: the command decides and runs for nothing else. `--diff` still shows what is written to the watched files, without running the command. `-w` has no effect.
+- `-T TIMEOUT`: Time the command has to decide, a decimal number of seconds above 0 (default: 5). When it runs out, the command's process group is killed and the access allowed; `deny` or `SECONDS:deny` denies it instead (fails closed)
+
 Diff:
 - `--diff`: Show what changed in each file, from a private cache
 - `-l FILE`: Also write the diffs to FILE (needs `--diff`)
