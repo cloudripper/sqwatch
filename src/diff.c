@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
+#include <limits.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -391,23 +392,10 @@ int is_binary_file(const char *filename, const char *io_path) {
   return -1; // Failed to read file after retries
 }
 
-void run_diff(const char *path, const char *io_path, const char *cache_dir,
+// cached_file_path is the watched file's own cache entry
+void run_diff(const char *path, const char *io_path, const char *cached_file_path,
               const char *event_type, int verbose, const char *log_file) {
-  char *path_copy = strdup(path);
-
-  if (!path_copy) {
-    perror(RED "Failed to allocate memory for path_copy" RESET);
-    return;
-  }
-
-  char *cached_file_path =
-      malloc(strlen(cache_dir) + strlen(basename(path_copy)) + 2);
-  if (!cached_file_path) {
-    perror(RED "Failed to allocate memory for cached_file_path" RESET);
-    free(path_copy);
-    return;
-  }
-  sprintf(cached_file_path, "%s/%s", cache_dir, basename(path_copy));
+  char shown[PATH_MAX];
 
   // Check if file is binary
   int bin_check = is_binary_file(path, io_path);
@@ -418,36 +406,28 @@ void run_diff(const char *path, const char *io_path, const char *cache_dir,
     }
 
     // Still update the cache for binary files
-    if (copy_file(io_path, cached_file_path) != 0) {
-      fprintf(stderr, RED "Failed to update cache file: %s\n" RESET,
-              cached_file_path);
+    if (copy_file(io_path, cached_file_path, path) != 0) {
+      fprintf(stderr, RED "Failed to update the cache of %s\n" RESET,
+              printable(path, shown, sizeof(shown)));
     }
 
-    free(path_copy);
-    free(cached_file_path);
     return;
   } else if (bin_check == -2) {
     fprintf(stderr, RED "+ Skipping %s this time: another process holds a lease on it\n" RESET,
             path);
-    free(path_copy);
-    free(cached_file_path);
     return;
   } else if (bin_check < 0) {
     fprintf(stderr, RED "Failed to read %s.\n" RESET, path);
-    free(path_copy);
-    free(cached_file_path);
     return;
   }
 
   file_lines current = read_file_lines(path, io_path, 0);
-  file_lines cached = read_file_lines(cached_file_path, cached_file_path, 1);
+  file_lines cached = read_file_lines(path, cached_file_path, 1);
 
   // A side skipped for a lease was not read: it is neither empty nor changed
   if (current.count < 0 || cached.count < 0) {
     free_file_lines(&current);
     free_file_lines(&cached);
-    free(cached_file_path);
-    free(path_copy);
     return;
   }
 
@@ -468,9 +448,9 @@ void run_diff(const char *path, const char *io_path, const char *cache_dir,
     }
 
     // Update cache regardless of which case
-    if (copy_file(io_path, cached_file_path) != 0) {
-      fprintf(stderr, RED "Failed to update cache file: %s\n" RESET,
-              cached_file_path);
+    if (copy_file(io_path, cached_file_path, path) != 0) {
+      fprintf(stderr, RED "Failed to update the cache of %s\n" RESET,
+              printable(path, shown, sizeof(shown)));
     }
   }
 
@@ -493,9 +473,9 @@ void run_diff(const char *path, const char *io_path, const char *cache_dir,
       }
 
       // Update the cache file with the current content
-      if (copy_file(io_path, cached_file_path) != 0) {
-        fprintf(stderr, RED "Failed to update cache file: %s\n" RESET,
-                cached_file_path);
+      if (copy_file(io_path, cached_file_path, path) != 0) {
+        fprintf(stderr, RED "Failed to update the cache of %s\n" RESET,
+                printable(path, shown, sizeof(shown)));
       }
     }
   }
@@ -503,8 +483,6 @@ void run_diff(const char *path, const char *io_path, const char *cache_dir,
   // Cleanup
   free_file_lines(&current);
   free_file_lines(&cached);
-  free(cached_file_path);
-  free(path_copy);
 }
 
 void print_bin_diff(const char *path, const char *io_path,

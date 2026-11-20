@@ -31,9 +31,14 @@ static int signal_fd = -1;
 static void cleanup(int signo) {
   printf(RED "\n+ Exiting SQWatch... \n" RESET);
 
-  // Wipe the cache directory if it exists
-  if (cache_dir && cache_dir_owned) {
-    printf(RED "+ Wiping cache directory: %s\n" RESET, cache_dir);
+  // Remove this run's cache entries, and the cache directory if this run
+  // made it
+  if (cache_dir && cache_dir_fd >= 0) {
+    if (cache_dir_owned) {
+      printf(RED "+ Wiping cache directory: %s\n" RESET, cache_dir);
+    } else {
+      printf(RED "+ Removing this run's cache entries from %s\n" RESET, cache_dir);
+    }
     remove_caches();
   }
 

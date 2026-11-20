@@ -216,8 +216,6 @@ static void watch_file(int inotify_fd, int parent_fd, const char *name, const ch
         config->path_count++;
         if (at_runtime && config->diff_enabled && cache_dir) {
             char io_path[FD_PATH_LEN];
-            free(config->cached_paths[wd]);
-            config->cached_paths[wd] = NULL;
             create_cache_for_file(path, fd_path(fd, io_path, sizeof(io_path)), cache_dir,
                                   &config->cached_paths[wd], config->verbose);
         }
@@ -656,17 +654,18 @@ void cache_watched_files(sqwatch_config *config) {
             continue;
         }
 
+        // Every file gets an entry of its own, written now
         char io_path[FD_PATH_LEN];
-        char dest_path[PATH_MAX];
-        snprintf(dest_path, sizeof(dest_path), "%s/%s", cache_dir,
-                 basename(config->watch_paths[i]));
-
-        if (copy_file(fd_path(fd, io_path, sizeof(io_path)), dest_path) == 0) {
-            config->cached_paths[i] = strdup(dest_path);
-            if (config->verbose) {
-                printf(DARK_GREY "+ Cached [%d]: %s -> %s\n" RESET, i, config->watch_paths[i],
-                       dest_path);
-            }
+        if (config->cached_paths[i]) {
+            unlink_cache_file(config->cached_paths[i]);
+            free(config->cached_paths[i]);
+        }
+        config->cached_paths[i] = cache_new_entry(cache_dir);
+        if (config->cached_paths[i] &&
+            copy_file(fd_path(fd, io_path, sizeof(io_path)), config->cached_paths[i],
+                      config->watch_paths[i]) == 0 && config->verbose) {
+            printf(DARK_GREY "+ Cached [%d]: %s\n" RESET, i,
+                   printable(config->watch_paths[i], shown, sizeof(shown)));
         }
         close(fd);
     }
@@ -837,12 +836,8 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                             config.watch_paths[new_wd] = strdup(full_path);
                             config.watch_roots[new_wd] = dir_root;
 
-                            // Free any existing cache path before creating new one
-                            if (config.cached_paths[new_wd]) {
-                                free(config.cached_paths[new_wd]);
-                                config.cached_paths[new_wd] = NULL;
-                            }
-
+                            // A file watched already (another name for it) keeps
+                            // its cache entry; create_cache_for_file() rewrites it
                             if (config.diff_enabled && cache_dir) {
                                 create_cache_for_file(full_path, io_path, cache_dir, &config.cached_paths[new_wd], config.verbose);
                             }
@@ -927,7 +922,7 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                     // Clean up cache path
                     if (config.cached_paths[event->wd]) {
                         if (config.verbose) {
-                            printf(DARK_GREY "+ Removing cache for: %s\n" RESET, config.cached_paths[event->wd]);
+                            printf(DARK_GREY "+ Removing cache for: %s\n" RESET, full_path);
                         }
                         unlink_cache_file(config.cached_paths[event->wd]); // Remove cache file
                         free(config.cached_paths[event->wd]);
@@ -1016,12 +1011,19 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
                             snprintf(event_desc, sizeof(event_desc), "Modified");
 
                             stop_if_signalled();
-                            run_diff(config.watch_paths[event_wd],
-                                io_path,
-                                cache_dir,
-                                event_desc,
-                                1, // diff is always verbose
-                                config.log_file);
+                            // A file without an entry (its copy failed) gets
+                            // one now; run_diff() then reports it as new
+                            if (!config.cached_paths[event_wd]) {
+                                config.cached_paths[event_wd] = cache_new_entry(cache_dir);
+                            }
+                            if (config.cached_paths[event_wd]) {
+                                run_diff(config.watch_paths[event_wd],
+                                    io_path,
+                                    config.cached_paths[event_wd],
+                                    event_desc,
+                                    1, // diff is always verbose
+                                    config.log_file);
+                            }
                         }
 
                     }

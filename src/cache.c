@@ -11,6 +11,7 @@
 #include <pwd.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <sys/vfs.h>
@@ -38,11 +39,16 @@
 
 int cache_dir_owned = 0;
 
-// The cache directory as create_caches() checked it. Cache files are reached
-// beneath this descriptor, never through the cache path again, so a directory
-// put in its place later is not used
+// This run's own directory inside the cache directory, run.<16 random hex
+// digits>, made by create_caches(). Cache entries are made and reached beneath
+// this descriptor, never through a path again, so a directory put in its
+// place later is not used, and nothing another run or an earlier one left in
+// the cache directory is ever read
 int cache_dir_fd = -1;
-// The checked parent of the cache directory, and the directory's name in it
+static char run_name[32];
+// The cache directory as create_caches() checked it, its checked parent and
+// its name in that parent
+static int cache_top_fd = -1;
 static int cache_parent_fd = -1;
 static char cache_leaf[PATH_MAX];
 
@@ -113,26 +119,30 @@ int open_watched_file(const char *io_path) {
   return fd;
 }
 
-int copy_file(const char *src, const char *dest) {
+// Copy the watched file src into the cache entry dest; shown names the watched
+// file in messages. When the copy fails the entry is removed, so that a part
+// of a copy is never read as the file's
+int copy_file(const char *src, const char *dest, const char *shown_path) {
   struct stat statbuf;
+  char shown[PATH_MAX];
 
   // Check if the destination is a directory
   if (fstatat(cache_dir_fd, cache_name(dest), &statbuf, AT_SYMLINK_NOFOLLOW) == 0 &&
       S_ISDIR(statbuf.st_mode)) {
-    fprintf(stderr, "Failed to open destination file: %s is a directory\n",
-            dest);
+    fprintf(stderr, "Failed to open the cache of %s: it is a directory\n",
+            printable(shown_path, shown, sizeof(shown)));
     return -1;
   }
 
   int src_fd = open_watched_file(src);
   if (src_fd < 0) {
-    char shown[PATH_MAX];
     if (errno == EWOULDBLOCK) {
-      fprintf(stderr, RED "+ Not updating %s this time: another process holds a lease on the file\n" RESET,
-              printable(dest, shown, sizeof(shown)));
+      fprintf(stderr, RED "+ Not updating the cache of %s this time: another process holds a lease on it\n" RESET,
+              printable(shown_path, shown, sizeof(shown)));
     } else {
       perror("Failed to open source file");
     }
+    unlink_cache_file(dest);
     return -1;
   }
 
@@ -142,7 +152,7 @@ int copy_file(const char *src, const char *dest) {
   if (dest_fd < 0) {
     perror("Failed to open destination file");
     close(src_fd);
-
+    unlink_cache_file(dest);
     return -1;
   }
 
@@ -155,6 +165,7 @@ int copy_file(const char *src, const char *dest) {
       perror("Failed to write to destination file");
       close(src_fd);
       close(dest_fd);
+      unlink_cache_file(dest);
       return -1;
     }
   }
@@ -492,8 +503,10 @@ static int open_trusted_parent(const char *what, const char *path, int is_dir, c
 // cache holds copies of the watched files, so a directory that is not the
 // user's own, or that others can write to, is refused. Its parent is opened
 // with open_trusted_parent() and the directory is made and opened beneath it,
-// by name. It is checked through the descriptor every later cache access goes
-// through. The watched files are copied in by cache_watched_files()
+// by name, and checked through that descriptor. Inside it this run makes a
+// directory of its own, which every later cache access goes through and which
+// is removed on exit (see remove_caches()). The watched files are copied in by
+// cache_watched_files()
 int create_caches(const char *cache_dir) {
   if (!cache_dir) {
     return -1;
@@ -535,11 +548,51 @@ int create_caches(const char *cache_dir) {
     return refuse_path("cache directory", cache_dir, NULL, reason);
   }
 
-  cache_dir_fd = fd;
+  // Only a directory this run made, and found empty, is removed on exit
+  int owned = created && dir_is_empty(fd);
+
+  // This run's own directory in it, under a name no other run picks
+  int run_fd = -1;
+  for (int tries = 0; run_fd < 0 && tries < 16; tries++) {
+    unsigned char random[8];
+    if (getrandom(random, sizeof(random), 0) != (ssize_t)sizeof(random)) {
+      reason = strerror(errno);
+      break;
+    }
+    snprintf(run_name, sizeof(run_name), "run.%02x%02x%02x%02x%02x%02x%02x%02x", random[0],
+             random[1], random[2], random[3], random[4], random[5], random[6], random[7]);
+    if (mkdirat(fd, run_name, 0700) != 0) {
+      if (errno != EEXIST) {
+        reason = strerror(errno);
+        break;
+      }
+      continue;
+    }
+    run_fd = openat(fd, run_name, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (run_fd < 0 || fstat(run_fd, &st) != 0) {
+      reason = strerror(errno);
+    } else if (st.st_uid != geteuid() || (st.st_mode & 077)) {
+      reason = "the directory made for this run is not the user's alone";
+    }
+    if (reason) {
+      break;
+    }
+  }
+  if (run_fd < 0 || reason) {
+    if (run_fd >= 0) {
+      close(run_fd);
+    }
+    close(fd);
+    close(parent_fd);
+    return refuse_path("cache directory", cache_dir, NULL, reason ? reason :
+                       "no unused name for this run's directory");
+  }
+
+  cache_dir_fd = run_fd;
+  cache_top_fd = fd;
   cache_parent_fd = parent_fd;
   snprintf(cache_leaf, sizeof(cache_leaf), "%s", leaf);
-  // Only a directory this run made, and found empty, is removed on exit
-  cache_dir_owned = created && dir_is_empty(fd);
+  cache_dir_owned = owned;
   if (!cache_dir_owned) {
     char shown[PATH_MAX];
     fprintf(stderr, DARK_GREY "+ Cache directory %s already exists; it will not be removed on exit\n" RESET,
@@ -818,48 +871,75 @@ void log_end(void) {
   }
 }
 
-// Remove the cache directory this run made: its contents beneath the
-// descriptor it was checked through, then its name in the checked parent, and
-// that only while the name still refers to the same directory
+// Remove what this run put in the cache: its run directory, emptied beneath
+// the descriptor it was made with and then removed by name while the name
+// still refers to it. The cache directory itself goes too if this run made it
+// and nothing else is in it now, again only while its name refers to it.
+// Nothing outside the run directory is removed from a directory this run did
+// not make
 void remove_caches(void) {
   struct stat named, pinned;
+  if (cache_dir_fd < 0) {
+    return;
+  }
   empty_directory(cache_dir_fd);
-  if (fstatat(cache_parent_fd, cache_leaf, &named, AT_SYMLINK_NOFOLLOW) == 0 &&
+  if (fstatat(cache_top_fd, run_name, &named, AT_SYMLINK_NOFOLLOW) == 0 &&
       fstat(cache_dir_fd, &pinned) == 0 &&
+      named.st_dev == pinned.st_dev && named.st_ino == pinned.st_ino) {
+    unlinkat(cache_top_fd, run_name, AT_REMOVEDIR);
+  }
+  if (cache_dir_owned && dir_is_empty(cache_top_fd) &&
+      fstatat(cache_parent_fd, cache_leaf, &named, AT_SYMLINK_NOFOLLOW) == 0 &&
+      fstat(cache_top_fd, &pinned) == 0 &&
       named.st_dev == pinned.st_dev && named.st_ino == pinned.st_ino) {
     unlinkat(cache_parent_fd, cache_leaf, AT_REMOVEDIR);
   }
 }
 
-// path names the file in messages and gives the cache file its name; the
-// content is read through io_path
+// A new cache entry: <cache_dir>/<run directory>/<n>, n counting up from 1.
+// It is made here, empty and with O_EXCL, in this run's own directory, so it
+// is unique among all the files this run watches, no name in a watched tree
+// can pick it, and it never holds anything this run did not write. Returns a
+// path to free, or NULL
+char *cache_new_entry(const char *cache_dir) {
+  static unsigned long entries = 0;
+  char name[32];
+  char *entry = NULL;
+  snprintf(name, sizeof(name), "%lu", ++entries);
+  int fd = openat(cache_dir_fd, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    return NULL;
+  }
+  close(fd);
+  if (asprintf(&entry, "%s/%s/%s", cache_dir, run_name, name) < 0) {
+    unlinkat(cache_dir_fd, name, 0);
+    return NULL;
+  }
+  return entry;
+}
+
+// Write the watched file path, read through io_path, into its cache entry
+// *cached_path. A file that has an entry already (the watch descriptor is the
+// same: another name for the same file) keeps it and it is written again;
+// otherwise a new entry is made. If the copy fails the entry is gone (see
+// copy_file()) and *cached_path is NULL
 void create_cache_for_file(const char *path, const char *io_path, const char *cache_dir,
                           char **cached_path, int verbose) {
     if (!path || !io_path || !cache_dir || !cached_path) {
         return;
     }
 
-    char *path_copy = strdup(path);
-    if (!path_copy) {
+    if (!*cached_path) {
+        *cached_path = cache_new_entry(cache_dir);
+    }
+    if (!*cached_path) {
         return;
     }
-
-    char *base = basename(path_copy);
-    char cache_path[PATH_MAX];
-    snprintf(cache_path, sizeof(cache_path), "%s/%s", cache_dir, base);
-
-    // Always update the cached_path pointer
-    *cached_path = strdup(cache_path);
-
-    // Only copy the file if it doesn't exist in cache
-    struct stat cache_stat;
-    if (fstatat(cache_dir_fd, base, &cache_stat, AT_SYMLINK_NOFOLLOW) != 0) {
-        if (copy_file(io_path, cache_path) == 0) {
-            if (verbose) {
-                printf(DARK_GREY "+ Cached: %s -> %s\n" RESET, path, cache_path);
-            }
-        }
+    if (copy_file(io_path, *cached_path, path) != 0) {
+        free(*cached_path);
+        *cached_path = NULL;
+    } else if (verbose) {
+        char shown[PATH_MAX];
+        printf(DARK_GREY "+ Cached: %s\n" RESET, printable(path, shown, sizeof(shown)));
     }
-
-    free(path_copy);
 }
