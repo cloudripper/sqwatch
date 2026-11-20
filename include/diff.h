@@ -24,13 +24,14 @@ struct diff_entry {
 };
 
 // Function declarations
-void run_diff(const char *path, const char *cache_dir, const char *event_type, int verbose, const char *log_file);
+// path is the name shown in messages and the log; io_path is what is read
+void run_diff(const char *path, const char *io_path, const char *cache_dir, const char *event_type, int verbose, const char *log_file);
 void print_diff(file_lines *current, file_lines *cached, int verbose);
 void read_file(const char *filename, char **content, size_t *length);
 void log_changes(const char *log_file, const char *path, const char *event_type, 
                 file_lines *current, file_lines *cached);
-int is_binary_file(const char *filename);
-void print_bin_diff(const char *path, const char *cached_file_path, const char *log_file);
+int is_binary_file(const char *filename, const char *io_path);
+void print_bin_diff(const char *path, const char *io_path, const char *cached_file_path, const char *log_file);
 void log_bin_diff(const char *log_file, const char *path, 
                  const struct diff_entry *diffs, size_t diff_count);
 #endif // DIFF_H 

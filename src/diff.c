@@ -19,13 +19,14 @@ static void free_file_lines(file_lines *fl) {
   }
 }
 
-static file_lines read_file_lines(const char *filename) {
+// filename is the name shown in messages; the file is read through io_path
+static file_lines read_file_lines(const char *filename, const char *io_path) {
   file_lines fl = {NULL, 0};
   int retry_count = 0;
   FILE *file = NULL;
 
   // Try to open the file a few times with a small delay
-  while ((file = fopen(filename, "r")) == NULL && retry_count < 3) {
+  while ((file = fopen(io_path, "r")) == NULL && retry_count < 3) {
     usleep(10000); // Wait 10ms between retries
     retry_count++;
   }
@@ -308,14 +309,14 @@ void log_changes(const char *log_file, const char *path, const char *event_type,
   fclose(log_fp);
 }
 
-int is_binary_file(const char *filename) {
+int is_binary_file(const char *filename, const char *io_path) {
   unsigned char buffer[4096];
   size_t bytes_read = 0;
   int retry_count = 0;
   const int max_retries = 3;
 
   while (retry_count < max_retries) {
-    FILE *file = fopen(filename, "rb");
+    FILE *file = fopen(io_path, "rb");
     if (!file) {
       fprintf(stderr, RED "Cannot open %s: %s\n" RESET, filename,
               strerror(errno));
@@ -344,8 +345,8 @@ int is_binary_file(const char *filename) {
   return -1; // Failed to read file after retries
 }
 
-void run_diff(const char *path, const char *cache_dir, const char *event_type,
-              int verbose, const char *log_file) {
+void run_diff(const char *path, const char *io_path, const char *cache_dir,
+              const char *event_type, int verbose, const char *log_file) {
   char *path_copy = strdup(path);
 
   if (!path_copy) {
@@ -363,15 +364,15 @@ void run_diff(const char *path, const char *cache_dir, const char *event_type,
   sprintf(cached_file_path, "%s/%s", cache_dir, basename(path_copy));
 
   // Check if file is binary
-  int bin_check = is_binary_file(path);
+  int bin_check = is_binary_file(path, io_path);
   if (bin_check > 0) {
     if (verbose) {
       printf(DARK_GREY "Binary file detected: %s\n" RESET, path);
-      print_bin_diff(path, cached_file_path, log_file);
+      print_bin_diff(path, io_path, cached_file_path, log_file);
     }
 
     // Still update the cache for binary files
-    if (copy_file(path, cached_file_path) != 0) {
+    if (copy_file(io_path, cached_file_path) != 0) {
       fprintf(stderr, RED "Failed to update cache file: %s\n" RESET,
               cached_file_path);
     }
@@ -386,8 +387,8 @@ void run_diff(const char *path, const char *cache_dir, const char *event_type,
     return;
   }
 
-  file_lines current = read_file_lines(path);
-  file_lines cached = read_file_lines(cached_file_path);
+  file_lines current = read_file_lines(path, io_path);
+  file_lines cached = read_file_lines(cached_file_path, cached_file_path);
 
   // First check if either file is empty
   if (!current.lines || !cached.lines) {
@@ -406,7 +407,7 @@ void run_diff(const char *path, const char *cache_dir, const char *event_type,
     }
 
     // Update cache regardless of which case
-    if (copy_file(path, cached_file_path) != 0) {
+    if (copy_file(io_path, cached_file_path) != 0) {
       fprintf(stderr, RED "Failed to update cache file: %s\n" RESET,
               cached_file_path);
     }
@@ -432,7 +433,7 @@ void run_diff(const char *path, const char *cache_dir, const char *event_type,
       }
 
       // Update the cache file with the current content
-      if (copy_file(path, cached_file_path) != 0) {
+      if (copy_file(io_path, cached_file_path) != 0) {
         fprintf(stderr, RED "Failed to update cache file: %s\n" RESET,
                 cached_file_path);
       }
@@ -446,9 +447,9 @@ void run_diff(const char *path, const char *cache_dir, const char *event_type,
   free(path_copy);
 }
 
-void print_bin_diff(const char *path, const char *cached_path,
-                    const char *log_file) {
-  FILE *f1 = fopen(path, "rb");
+void print_bin_diff(const char *path, const char *io_path,
+                    const char *cached_path, const char *log_file) {
+  FILE *f1 = fopen(io_path, "rb");
   FILE *f2 = fopen(cached_path, "rb");
 
   if (!f1 || !f2) {

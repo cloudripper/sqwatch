@@ -26,7 +26,9 @@ int copy_file(const char *src, const char *dest) {
     return -1;
   }
 
-  int dest_fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  // The cache file name comes from the watched tree; never write through a
+  // symlink planted under that name
+  int dest_fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
   if (dest_fd < 0) {
     perror("Failed to open destination file");
     close(src_fd);
@@ -80,10 +82,11 @@ void remove_directory(const char *path) {
   }
 }
 
-void create_caches(int max_files, const char *cache_dir, char *watch_paths[],
-                   char *cached_paths[], int verbose) {
-  if (!cache_dir || !watch_paths || !cached_paths) {
-    return;
+// Set up the cache directory. Returns 0 if it can be used, -1 otherwise. The
+// watched files are copied in by cache_watched_files()
+int create_caches(const char *cache_dir) {
+  if (!cache_dir) {
+    return -1;
   }
 
   if (mkdir(cache_dir, 0700) == 0) {
@@ -92,35 +95,22 @@ void create_caches(int max_files, const char *cache_dir, char *watch_paths[],
     struct stat st;
     if (lstat(cache_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
         fprintf(stderr, RED "Cache path %s exists and is not a directory\n" RESET, cache_dir);
-        return;
+        return -1;
     }
     fprintf(stderr, DARK_GREY "+ Cache directory %s already exists; it will not be removed on exit\n" RESET, cache_dir);
   } else {
     perror("Failed to create cache directory");
-    return;
+    return -1;
   }
 
-  // For each watched path, create a cache file
-  for (int i = 0; i < max_files; i++) {
-    if (watch_paths[i] != NULL) {
-      char dest_path[PATH_MAX];
-      snprintf(dest_path, sizeof(dest_path), "%s/%s", cache_dir,
-               basename(watch_paths[i]));
-
-      if (copy_file(watch_paths[i], dest_path) == 0) {
-        cached_paths[i] = strdup(dest_path);
-        if (verbose) {
-          printf(DARK_GREY "+ Cached [%d]: %s -> %s\n" RESET, i, watch_paths[i],
-                 dest_path);
-        }
-      }
-    }
-  }
+  return 0;
 }
 
-void create_cache_for_file(const char *path, const char *cache_dir,
+// path names the file in messages and gives the cache file its name; the
+// content is read through io_path
+void create_cache_for_file(const char *path, const char *io_path, const char *cache_dir,
                           char **cached_path, int verbose) {
-    if (!path || !cache_dir || !cached_path) {
+    if (!path || !io_path || !cache_dir || !cached_path) {
         return;
     }
 
@@ -139,7 +129,7 @@ void create_cache_for_file(const char *path, const char *cache_dir,
     // Only copy the file if it doesn't exist in cache
     struct stat cache_stat;
     if (stat(cache_path, &cache_stat) != 0) {
-        if (copy_file(path, cache_path) == 0) {
+        if (copy_file(io_path, cache_path) == 0) {
             if (verbose) {
                 printf(DARK_GREY "+ Cached: %s -> %s\n" RESET, path, cache_path);
             }

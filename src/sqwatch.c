@@ -1,6 +1,7 @@
 #include "cache.h"
 #include "diff.h"
 #include "sqwatch.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <signal.h>
@@ -61,6 +62,7 @@ int main(int argc, char *argv[]) {
   }
   config.dir_watch_count = 0;
   config.max_dir_watches = INITIAL_DIR_WATCHES;
+  config.root_count = 0;
 
   // Determine the default cache directory
   inotify_fd = inotify_init();
@@ -215,12 +217,27 @@ int main(int argc, char *argv[]) {
   config.command = command;
   config.flags = flags;
 
+  // Watches are set and files are read through /proc/self/fd/N so that they
+  // act on an already opened descriptor instead of resolving a path again
+  int proc_fd = open("/proc/self/fd", O_RDONLY | O_DIRECTORY);
+  if (proc_fd == -1) {
+    fprintf(stderr, "Error: cannot open /proc/self/fd (%s). sqwatch needs /proc to be mounted.\n", strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+  close(proc_fd);
+
   for (int i = 0; i < path_count; i++) {
     add_watches_recursive(inotify_fd, paths[i], flags, &config);
   }
 
   if (cache_dir && config.diff_enabled) {
-    create_caches(MAX_PATHS, cache_dir, config.watch_paths, config.cached_paths, verbose);
+    if (create_caches(cache_dir) == 0) {
+      cache_watched_files(&config);
+    } else {
+      // Diffs would read and write files under that path: do not diff at all
+      config.diff_enabled = 0;
+      fprintf(stderr, RED "+ Diff disabled: cache directory %s cannot be used\n" RESET, cache_dir);
+    }
   }
 
   handle_events(inotify_fd, config);

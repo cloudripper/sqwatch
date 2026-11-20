@@ -1,3 +1,4 @@
+#define _GNU_SOURCE  // O_PATH
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -20,6 +21,9 @@
 #include "sqwatch.h"
 #include "diff.h"
 
+
+// Room for "/proc/self/fd/" followed by any int
+#define FD_PATH_LEN 32
 
 extern pid_t g_last_pid;
 extern char **environ;
@@ -71,10 +75,141 @@ void print_event_type(struct inotify_event *event) {
   fflush(stdout);  // Ensure partial line is displayed
 }
 
-static void add_watches_walk(int inotify_fd, const char *path, uint32_t flags, sqwatch_config *config, int follow_symlinks) {
+// Copy a path for display, replacing control characters so a file name
+// cannot inject terminal escapes or extra lines into the output
+static const char *printable(const char *path, char *buf, size_t size) {
+    size_t i = 0;
+    for (; path[i] != '\0' && i + 1 < size; i++) {
+        unsigned char c = (unsigned char)path[i];
+        buf[i] = (c < 0x20 || c == 0x7f) ? '?' : (char)c;
+    }
+    buf[i] = '\0';
+    return buf;
+}
+
+// Write the path that names whatever fd has open. Used through this path, a
+// file or directory is the one that was opened and checked, no matter what its
+// name in the watched tree points to by now
+static const char *fd_path(int fd, char *buf, size_t size) {
+    snprintf(buf, size, "/proc/self/fd/%d", fd);
+    return buf;
+}
+
+// Watch exactly the inode fd refers to. The /proc link has to be followed to
+// get there, so IN_DONT_FOLLOW must not be set
+static int add_watch_fd(int inotify_fd, int fd, uint32_t flags) {
+    char io_path[FD_PATH_LEN];
+    return add_watch(inotify_fd, fd_path(fd, io_path, sizeof(io_path)), flags);
+}
+
+// Path of a watched entry relative to its root. Below a directory root every
+// displayed path is "<root path>/<relative path>"; a file root has one entry
+static const char *rel_path(const watch_root *root, const char *path) {
+    if (root->rel) {
+        return root->rel;
+    }
+    size_t len = strlen(root->path);
+    return path[len] == '\0' ? "" : path + len + 1;
+}
+
+// Open rel beneath the directory root_fd without following a symlink in any
+// component, the last one included. Every component is opened relative to the
+// descriptor of the one before it, so renaming or replacing things in the tree
+// cannot lead the lookup out of it. An empty rel is the root itself. Returns a
+// descriptor, or -1 with errno set
+static int open_beneath(int root_fd, const char *rel, int flags) {
+    int dir_fd = root_fd;
+
+    rel += strspn(rel, "/");
+    if (*rel == '\0') {
+        return openat(root_fd, ".", flags | O_NOFOLLOW | O_CLOEXEC);
+    }
+
+    while (1) {
+        char name[NAME_MAX + 1];
+        size_t len = strcspn(rel, "/");
+        // Repeated slashes count as one separator
+        const char *next = rel + len + strspn(rel + len, "/");
+        int last = (*next == '\0');
+        int fd = -1;
+
+        if (len > NAME_MAX) {
+            errno = ENAMETOOLONG;
+        } else {
+            memcpy(name, rel, len);
+            name[len] = '\0';
+            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+                errno = EINVAL;
+            } else {
+                fd = openat(dir_fd, name, last ? (flags | O_NOFOLLOW | O_CLOEXEC)
+                            : (O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+            }
+        }
+
+        int saved_errno = errno;
+        if (dir_fd != root_fd) {
+            close(dir_fd);
+        }
+        errno = saved_errno;
+
+        if (fd == -1) {
+            return -1;
+        }
+        if (last) {
+            // O_PATH | O_NOFOLLOW opens a symlink itself instead of failing
+            struct stat st;
+            if ((flags & O_PATH) && (fstat(fd, &st) != 0 || S_ISLNK(st.st_mode))) {
+                close(fd);
+                errno = ELOOP;
+                return -1;
+            }
+            return fd;
+        }
+        dir_fd = fd;
+        rel = next;
+    }
+}
+
+// Open the regular file `name` in the directory parent_fd without following a
+// symlink. Returns an O_PATH descriptor, or -1 if it is not a regular file
+static int open_file_at(int parent_fd, const char *name) {
+    struct stat st;
+    int fd = openat(parent_fd, name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (fd != -1 && (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))) {
+        close(fd);
+        fd = -1;
+    }
+    return fd;
+}
+
+// The directory of a -f file is the operator's path and may have been
+// replaced since it was opened (moved aside and created again, or a symlink in
+// it switched). Open it again by that path and use it from now on if it is a
+// different directory. Returns 1 if root->fd changed
+static int reopen_file_root(watch_root *root) {
+    struct stat old_st, new_st;
+    int fd = open(root->path, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (fd == -1) {
+        return 0;
+    }
+    if (fstat(fd, &new_st) == 0 && fstat(root->fd, &old_st) == 0 &&
+        (new_st.st_dev != old_st.st_dev || new_st.st_ino != old_st.st_ino)) {
+        close(root->fd);
+        root->fd = fd;
+        return 1;
+    }
+    close(fd);
+    return 0;
+}
+
+// Add watches for the entry `name` of the directory parent_fd and, if it is a
+// directory, for everything below it. path is the entry's displayed path.
+// Entries are only ever reached relative to a descriptor and symlinks are not
+// followed, so the walk cannot leave the tree it started in
+static void add_watches_walk(int inotify_fd, int parent_fd, const char *name, const char *path,
+                             int root, uint32_t flags, sqwatch_config *config) {
     struct stat path_stat;
-    int rc = follow_symlinks ? stat(path, &path_stat) : lstat(path, &path_stat);
-    if (rc == -1) {
+    if (fstatat(parent_fd, name, &path_stat, AT_SYMLINK_NOFOLLOW) == -1) {
         fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, path, strerror(errno));
         return;
     }
@@ -86,11 +221,15 @@ static void add_watches_walk(int inotify_fd, const char *path, uint32_t flags, s
         return;
     }
 
-    uint32_t watch_flags = follow_symlinks ? flags : (flags | IN_DONT_FOLLOW);
-
     if (S_ISDIR(path_stat.st_mode)) {
+        int dir_fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (dir_fd == -1) {
+            fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, path, strerror(errno));
+            return;
+        }
+
         // Add directory watch separately from file watches
-        int wd = add_watch(inotify_fd, path, watch_flags | IN_CREATE);
+        int wd = add_watch_fd(inotify_fd, dir_fd, flags | IN_CREATE);
         if (wd != -1) {
             // Add to directory watches
             if (config->dir_watch_count >= config->max_dir_watches) {
@@ -99,6 +238,7 @@ static void add_watches_walk(int inotify_fd, const char *path, uint32_t flags, s
                                                new_size * sizeof(dir_watch));
                 if (!new_watches) {
                     fprintf(stderr, RED "+ Failed to allocate memory for dir watches\n" RESET);
+                    close(dir_fd);
                     return;
                 }
                 config->dir_watches = new_watches;
@@ -107,6 +247,7 @@ static void add_watches_walk(int inotify_fd, const char *path, uint32_t flags, s
 
             config->dir_watches[config->dir_watch_count].path = strdup(path);
             config->dir_watches[config->dir_watch_count].wd = wd;
+            config->dir_watches[config->dir_watch_count].root = root;
             config->dir_watch_count++;
 
             if (config->verbose) {
@@ -114,10 +255,12 @@ static void add_watches_walk(int inotify_fd, const char *path, uint32_t flags, s
             }
         }
 
-        // Recurse into directory contents
-        DIR *dir = opendir(path);
+        // Recurse into directory contents. The stream takes over dir_fd and
+        // closedir() closes it
+        DIR *dir = fdopendir(dir_fd);
         if (!dir) {
             fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, path, strerror(errno));
+            close(dir_fd);
             return;
         }
 
@@ -134,39 +277,137 @@ static void add_watches_walk(int inotify_fd, const char *path, uint32_t flags, s
                         path, entry->d_name);
                 continue;
             }
-            add_watches_walk(inotify_fd, full_path, flags, config, 0);
+            add_watches_walk(inotify_fd, dir_fd, entry->d_name, full_path, root, flags, config);
         }
         closedir(dir);
     } else if (S_ISREG(path_stat.st_mode)) {
         // Regular file handling remains unchanged
-        int wd = add_watch(inotify_fd, path, watch_flags);
+        int fd = open_file_at(parent_fd, name);
+        int wd = fd == -1 ? -1 : add_watch_fd(inotify_fd, fd, flags);
         if (wd >= 0 && wd < MAX_PATHS) {
             config->watch_paths[wd] = strdup(path);
+            config->watch_roots[wd] = root;
             config->path_count++;
             if (config->verbose) {
                 printf(CYAN "+ Watch set for file %s\n" RESET, path);
             }
         }
+        if (fd != -1) {
+            close(fd);
+        }
     }
 }
 
+// Start watching a path named on the command line. This and
+// reopen_file_root() are the only places where symlinks are followed: the
+// operator's path is trusted, what is found beneath it later is not
 void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags,
                            sqwatch_config *config) {
-    add_watches_walk(inotify_fd, path, flags, config, 1);
-}
-
-
-// Copy a path for display, replacing control characters so a file name
-// cannot inject terminal escapes or extra lines into the output
-static const char *printable(const char *path, char *buf, size_t size) {
-    size_t i = 0;
-    for (; path[i] != '\0' && i + 1 < size; i++) {
-        unsigned char c = (unsigned char)path[i];
-        buf[i] = (c < 0x20 || c == 0x7f) ? '?' : (char)c;
+    struct stat path_stat;
+    if (stat(path, &path_stat) == -1) {
+        fprintf(stderr, RED "+ Failed to stat %s: %s\n" RESET, path, strerror(errno));
+        return;
     }
-    buf[i] = '\0';
-    return buf;
+    if (config->root_count >= MAX_PATHS) {
+        return;
+    }
+
+    watch_root *root = &config->roots[config->root_count];
+    const char *name = ".";
+    root->path = NULL;
+    root->rel = NULL;
+    root->fd = -1;
+
+    if (S_ISDIR(path_stat.st_mode)) {
+        root->path = strdup(path);
+        root->fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    } else {
+        // The directory part of the path is the operator's: it is opened
+        // following symlinks, now and whenever the file has to be found
+        // again. The file itself never is; if the path names a symlink, the
+        // file it points to now is watched inside its real directory
+        struct stat link_stat;
+        char *given = lstat(path, &link_stat) == 0 && S_ISLNK(link_stat.st_mode) ?
+            realpath(path, NULL) : strdup(path);
+        char *dir = given ? strdup(given) : NULL;
+        if (dir) {
+            root->path = strdup(dirname(dir));
+            root->rel = strdup(basename(given));
+            if (root->path) {
+                root->fd = open(root->path, O_PATH | O_DIRECTORY | O_CLOEXEC);
+            }
+        }
+        name = root->rel;
+        free(given);
+        free(dir);
+    }
+
+    // A -f root is only walked if it names a regular file in its directory
+    const char *error = NULL;
+    if (root->fd == -1 || !root->path || !name) {
+        error = strerror(errno);
+    } else if (root->rel && fstatat(root->fd, root->rel, &path_stat, AT_SYMLINK_NOFOLLOW) != 0) {
+        error = strerror(errno);
+    } else if (root->rel && !S_ISREG(path_stat.st_mode)) {
+        error = "not a regular file";
+    }
+
+    if (error) {
+        char shown[PATH_MAX];
+        fprintf(stderr, RED "+ Failed to open %s: %s\n" RESET,
+                printable(path, shown, sizeof(shown)), error);
+        if (root->fd != -1) {
+            close(root->fd);
+        }
+        free(root->path);
+        free(root->rel);
+        return;
+    }
+
+    config->root_count++;
+    add_watches_walk(inotify_fd, root->fd, name, path, config->root_count - 1, flags, config);
 }
+
+// Copy every watched file into the cache at startup, overwriting what is
+// there. Each file is opened beneath its root and read through that descriptor
+void cache_watched_files(sqwatch_config *config) {
+    for (int i = 0; i < MAX_PATHS; i++) {
+        if (config->watch_paths[i] == NULL) {
+            continue;
+        }
+
+        const watch_root *root = &config->roots[config->watch_roots[i]];
+        struct stat st;
+        char shown[PATH_MAX];
+        int fd = open_beneath(root->fd, rel_path(root, config->watch_paths[i]), O_PATH);
+        if (fd == -1) {
+            fprintf(stderr, RED "+ Not caching %s: %s\n" RESET,
+                    printable(config->watch_paths[i], shown, sizeof(shown)), strerror(errno));
+            continue;
+        }
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+            fprintf(stderr, RED "+ Not caching %s: no longer a regular file\n" RESET,
+                    printable(config->watch_paths[i], shown, sizeof(shown)));
+            close(fd);
+            continue;
+        }
+
+        char io_path[FD_PATH_LEN];
+        char dest_path[PATH_MAX];
+        snprintf(dest_path, sizeof(dest_path), "%s/%s", cache_dir,
+                 basename(config->watch_paths[i]));
+
+        if (copy_file(fd_path(fd, io_path, sizeof(io_path)), dest_path) == 0) {
+            config->cached_paths[i] = strdup(dest_path);
+            if (config->verbose) {
+                printf(DARK_GREY "+ Cached [%d]: %s -> %s\n" RESET, i, config->watch_paths[i],
+                       dest_path);
+            }
+        }
+        close(fd);
+    }
+}
+
 
 // Terminate the process group of the previously started command, if any
 static void stop_command(void) {
@@ -264,10 +505,12 @@ void handle_events(int inotify_fd, sqwatch_config config) {
             // Check if this is a directory watch event
             int is_dir_watch = 0;
             char *dir_path = NULL;
+            int dir_root = 0;
             for (int d = 0; d < config.dir_watch_count; d++) {
                 if (config.dir_watches[d].wd == event->wd) {
                     is_dir_watch = 1;
                     dir_path = config.dir_watches[d].path;
+                    dir_root = config.dir_watches[d].root;
                     break;
                 }
             }
@@ -280,21 +523,29 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                     continue;
                 }
 
+                // Reach the directory from its root without following symlinks
+                // and look at the new entry relative to that descriptor
+                const watch_root *root = &config.roots[dir_root];
+                int dir_fd = open_beneath(root->fd, rel_path(root, dir_path), O_PATH | O_DIRECTORY);
                 struct stat path_stat;
-                if (lstat(full_path, &path_stat) == 0) {
+                if (dir_fd != -1 && fstatat(dir_fd, event->name, &path_stat, AT_SYMLINK_NOFOLLOW) == 0) {
                     if (S_ISLNK(path_stat.st_mode)) {
                         if (config.verbose) {
                             printf(DARK_GREY "+ Skipping symlink %s\n" RESET, full_path);
                         }
                     } else if (S_ISREG(path_stat.st_mode)) {
                         // New file created - add watch
-                        int new_wd = add_watch(inotify_fd, full_path, config.flags | IN_DONT_FOLLOW);
+                        char io_path[FD_PATH_LEN];
+                        int file_fd = open_file_at(dir_fd, event->name);
+                        int new_wd = file_fd == -1 ? -1 :
+                            add_watch(inotify_fd, fd_path(file_fd, io_path, sizeof(io_path)), config.flags);
                         if (new_wd >= 0 && new_wd < MAX_PATHS) {
                             // Free any existing path at this watch descriptor
                             if (config.watch_paths[new_wd]) {
                                 free(config.watch_paths[new_wd]);
                             }
                             config.watch_paths[new_wd] = strdup(full_path);
+                            config.watch_roots[new_wd] = dir_root;
 
                             // Free any existing cache path before creating new one
                             if (config.cached_paths[new_wd]) {
@@ -303,16 +554,19 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                             }
 
                             if (config.diff_enabled && cache_dir) {
-                                create_cache_for_file(full_path, cache_dir, &config.cached_paths[new_wd], config.verbose);
+                                create_cache_for_file(full_path, io_path, cache_dir, &config.cached_paths[new_wd], config.verbose);
                             }
 
                             if (config.verbose) {
                                 printf(CYAN "+ Added watch for new file: %s\n" RESET, full_path);
                             }
                         }
+                        if (file_fd != -1) {
+                            close(file_fd);
+                        }
                     } else if (S_ISDIR(path_stat.st_mode)) {
                         // New directory created - add recursive watches
-                        add_watches_recursive(inotify_fd, full_path, config.flags, &config);
+                        add_watches_walk(inotify_fd, dir_fd, event->name, full_path, dir_root, config.flags, &config);
                     }
 
                     // Directory watches always carry IN_CREATE to pick up new
@@ -327,6 +581,9 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                         start_command(config.command);
                         last_create = now;
                     }
+                }
+                if (dir_fd != -1) {
+                    close(dir_fd);
                 }
             } else if (!is_dir_watch && event->wd < MAX_PATHS && config.watch_paths[event->wd]) {
                 char full_path[PATH_MAX];
@@ -345,9 +602,26 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                     continue;
                 }
 
-                // Check if file still exists for any event
+                // Check if file still exists for any event. It is opened once,
+                // without following symlinks, and everything below acts on
+                // this descriptor instead of resolving the path again
+                watch_root *root = &config.roots[config.watch_roots[event_wd]];
+                int file_fd = open_beneath(root->fd, rel_path(root, full_path), O_PATH);
+                // A -f file may be gone because its directory was replaced:
+                // look for it once more in what its directory path names now
+                if (root->rel && ((event->mask & IN_IGNORED) ||
+                                  (file_fd == -1 && (errno == ENOENT || errno == ENOTDIR))) &&
+                    reopen_file_root(root)) {
+                    if (file_fd != -1) {
+                        close(file_fd);
+                    }
+                    file_fd = open_beneath(root->fd, rel_path(root, full_path), O_PATH);
+                }
                 struct stat path_stat;
-                if (stat(full_path, &path_stat) != 0) {
+                if (file_fd == -1 || fstat(file_fd, &path_stat) != 0 || !S_ISREG(path_stat.st_mode)) {
+                    if (file_fd != -1) {
+                        close(file_fd);
+                    }
                     if (config.verbose) {
                         printf(DARK_GREY "+ File no longer exists: %s\n" RESET, full_path);
                     }
@@ -367,50 +641,37 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                     i += EVENT_SIZE + event->len;
                     continue;
                 }
+                char io_path[FD_PATH_LEN];
+                fd_path(file_fd, io_path, sizeof(io_path));
 
                 // IN_IGNORE is when text editors like helix save a file.
                 // We need to reapply the watch to the file in case the file was not deleted.
                 if (event->mask & IN_IGNORED) {
                     watch_updated = 1;
-                    struct stat path_stat;
-                    if (stat(full_path, &path_stat) == 0) {  // File still exists
-                        int new_wd = add_watch(inotify_fd, full_path, config.flags);
+                    int new_wd = add_watch(inotify_fd, io_path, config.flags);
 
-                        if (new_wd >= 0 && new_wd < MAX_PATHS) {
-                            // Free old path if it exists at new_wd
-                            if (config.watch_paths[new_wd]) {
-                                free(config.watch_paths[new_wd]);
-                            }
-                            config.watch_paths[new_wd] = strdup(full_path);
-                            if (!config.watch_paths[new_wd]) {
-                                fprintf(stderr, RED "+ Out of memory tracking %s\n" RESET, full_path);
-                                i += EVENT_SIZE + event->len;
-                                continue;
-                            }
-                            if (event_wd != new_wd) {
-                                config.cached_paths[new_wd] = config.cached_paths[event_wd];
-                                config.cached_paths[event_wd] = NULL;
-                            }
-
-                            if (config.verbose) {
-                                printf(DARK_GREY "+ Reapplied watch for %s\n" RESET, full_path);
-                            }
-                            event_wd = new_wd;
+                    if (new_wd >= 0 && new_wd < MAX_PATHS) {
+                        // Free old path if it exists at new_wd
+                        if (config.watch_paths[new_wd]) {
+                            free(config.watch_paths[new_wd]);
                         }
-                    } else {
+                        config.watch_paths[new_wd] = strdup(full_path);
+                        if (!config.watch_paths[new_wd]) {
+                            fprintf(stderr, RED "+ Out of memory tracking %s\n" RESET, full_path);
+                            close(file_fd);
+                            i += EVENT_SIZE + event->len;
+                            continue;
+                        }
+                        config.watch_roots[new_wd] = config.watch_roots[event_wd];
+                        if (event_wd != new_wd) {
+                            config.cached_paths[new_wd] = config.cached_paths[event_wd];
+                            config.cached_paths[event_wd] = NULL;
+                        }
+
                         if (config.verbose) {
-                            printf(DARK_GREY "+ File no longer exists: %s\n" RESET, full_path);
+                            printf(DARK_GREY "+ Reapplied watch for %s\n" RESET, full_path);
                         }
-                        free(config.watch_paths[event->wd]);
-                        config.watch_paths[event->wd] = NULL;
-
-                        if (config.cached_paths[event->wd]) {
-                            unlink(config.cached_paths[event->wd]);
-                            free(config.cached_paths[event->wd]);
-                            config.cached_paths[event->wd] = NULL;
-                        }
-                        i += EVENT_SIZE + event->len;
-                        continue;
+                        event_wd = new_wd;
                     }
                 }
 
@@ -450,6 +711,7 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                             snprintf(event_desc, sizeof(event_desc), "Modified");
 
                             run_diff(config.watch_paths[event_wd],
+                                io_path,
                                 cache_dir,
                                 event_desc,
                                 1, // diff is always verbose
@@ -466,6 +728,7 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                     strncat(event_buffer, event_desc, sizeof(event_buffer) - strlen(event_buffer) - 1);
                     events_since_last_run++;
                 }
+                close(file_fd);
             }
 
             i += EVENT_SIZE + event->len;

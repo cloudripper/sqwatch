@@ -21,14 +21,29 @@
 extern pid_t g_last_pid;
 extern char *cache_dir;
 
+// A path named on the command line. Symlinks in it are followed once, at
+// startup; everything beneath it is then reached from fd without following any.
+// The directory of a -f file is the exception: it is opened again by path when
+// the file cannot be found in it any more
+typedef struct {
+    char *path;              // -d: prefix of the displayed paths of its entries;
+                             // -f: the file's directory, as it is opened again
+    int fd;                  // Directory all lookups start from
+    char *rel;               // -f only: name of the watched file inside fd
+} watch_root;
+
 typedef struct {
     char *path;
     int wd;
+    int root;                // Index into roots
 } dir_watch;
 
 typedef struct {
     char *watch_paths[MAX_PATHS];
     char *cached_paths[MAX_PATHS];
+    int watch_roots[MAX_PATHS];  // Root of each file watch, by watch descriptor
+    watch_root roots[MAX_PATHS];
+    int root_count;
     int path_count;
     uint8_t debounce_t;
     int verbose;
@@ -46,6 +61,7 @@ typedef struct {
 
 int add_watch(int inotify_fd, const char *path, int flags);
 void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags, sqwatch_config *config);
+void cache_watched_files(sqwatch_config *config);
 void handle_events(int inotify_fd, sqwatch_config config);
 void print_usage(void);
 
