@@ -1,5 +1,6 @@
 #include "cache.h"
 #include "diff.h"
+#include "sqwatch.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
@@ -29,18 +30,42 @@ static FILE *fopen_cache(const char *path) {
   return file;
 }
 
+// Open a watched file; see open_watched_file()
+static FILE *fopen_watched(const char *io_path, const char *mode) {
+  int fd = open_watched_file(io_path);
+  FILE *file = fd < 0 ? NULL : fdopen(fd, mode);
+  if (fd >= 0 && !file) {
+    close(fd);
+  }
+  return file;
+}
+
+// Every 256 steps through the lines of a diff, leave if a signal is waiting
+static void check_signals_every_256(int *steps) {
+  if ((++*steps & 255) == 0) {
+    stop_if_signalled();
+  }
+}
+
 // filename is the name shown in messages; the file is read through io_path,
-// which names a file in the cache directory if cache_side is set
+// which names a file in the cache directory if cache_side is set. A count of
+// -1 means the file was skipped as another process holds a lease on it
 static file_lines read_file_lines(const char *filename, const char *io_path, int cache_side) {
   file_lines fl = {NULL, 0};
   int retry_count = 0;
   FILE *file = NULL;
 
   // Try to open the file a few times with a small delay
-  while ((file = cache_side ? fopen_cache(io_path) : fopen(io_path, "r")) == NULL &&
-         retry_count < 3) {
+  while ((file = cache_side ? fopen_cache(io_path) : fopen_watched(io_path, "r")) == NULL &&
+         errno != EWOULDBLOCK && retry_count < 3) {
     usleep(10000); // Wait 10ms between retries
     retry_count++;
+  }
+  if (!file && errno == EWOULDBLOCK) {
+    fprintf(stderr, RED "+ Skipping %s this time: another process holds a lease on it\n" RESET,
+            filename);
+    fl.count = -1;
+    return fl;
   }
   if (!file) {
     fprintf(stderr, RED "Failed to open %s after %d retries: %s\n" RESET,
@@ -88,6 +113,9 @@ static file_lines read_file_lines(const char *filename, const char *io_path, int
 
   // Read lines using fgets
   while (fgets(line, sizeof(line), file)) {
+    if ((fl.count & 1023) == 1023) {
+      stop_if_signalled();
+    }
     // Remove trailing newline if present
     size_t len = strlen(line);
     if (len > 0 && line[len - 1] == '\n') {
@@ -128,8 +156,10 @@ void print_diff(file_lines *current, file_lines *cached, int verbose) {
   int context_lines = 0;
   int in_change_block = 0;
   int lines_since_change = 0;
+  int steps = 0;
 
   while (i < current->count && j < cached->count) {
+    check_signals_every_256(&steps);
     if (strcmp(current->lines[i], cached->lines[j]) == 0) {
       // Lines match - show context if needed
       if (in_change_block && lines_since_change < context_lines) {
@@ -213,10 +243,12 @@ void print_diff(file_lines *current, file_lines *cached, int verbose) {
 
   // Print any remaining lines
   while (i < current->count) {
+    check_signals_every_256(&steps);
     printf(GREEN "+%d: %s\n" RESET, i + 1, current->lines[i]);
     i++;
   }
   while (j < cached->count) {
+    check_signals_every_256(&steps);
     printf(RED "-%d: %s\n" RESET, j + 1, cached->lines[j]);
     j++;
   }
@@ -253,8 +285,10 @@ void log_changes(const char *log_file, const char *path, const char *event_type,
 
   int i = 0, j = 0;
   int in_change_block = 0;
+  int steps = 0;
 
   while (i < current->count && j < cached->count) {
+    check_signals_every_256(&steps);
     if (strcmp(current->lines[i], cached->lines[j]) == 0) {
       i++;
       j++;
@@ -309,10 +343,12 @@ void log_changes(const char *log_file, const char *path, const char *event_type,
   }
 
   while (i < current->count) {
+    check_signals_every_256(&steps);
     fprintf(log_fp, "+%d: %s\n", i + 1, current->lines[i]);
     i++;
   }
   while (j < cached->count) {
+    check_signals_every_256(&steps);
     fprintf(log_fp, "-%d: %s\n", j + 1, cached->lines[j]);
     j++;
   }
@@ -328,7 +364,10 @@ int is_binary_file(const char *filename, const char *io_path) {
   const int max_retries = 3;
 
   while (retry_count < max_retries) {
-    FILE *file = fopen(io_path, "rb");
+    FILE *file = fopen_watched(io_path, "rb");
+    if (!file && errno == EWOULDBLOCK) {
+      return -2; // Leased by another process: run_diff() says so
+    }
     if (!file) {
       fprintf(stderr, RED "Cannot open %s: %s\n" RESET, filename,
               strerror(errno));
@@ -392,6 +431,12 @@ void run_diff(const char *path, const char *io_path, const char *cache_dir,
     free(path_copy);
     free(cached_file_path);
     return;
+  } else if (bin_check == -2) {
+    fprintf(stderr, RED "+ Skipping %s this time: another process holds a lease on it\n" RESET,
+            path);
+    free(path_copy);
+    free(cached_file_path);
+    return;
   } else if (bin_check < 0) {
     fprintf(stderr, RED "Failed to read %s.\n" RESET, path);
     free(path_copy);
@@ -401,6 +446,15 @@ void run_diff(const char *path, const char *io_path, const char *cache_dir,
 
   file_lines current = read_file_lines(path, io_path, 0);
   file_lines cached = read_file_lines(cached_file_path, cached_file_path, 1);
+
+  // A side skipped for a lease was not read: it is neither empty nor changed
+  if (current.count < 0 || cached.count < 0) {
+    free_file_lines(&current);
+    free_file_lines(&cached);
+    free(cached_file_path);
+    free(path_copy);
+    return;
+  }
 
   // First check if either file is empty
   if (!current.lines || !cached.lines) {
@@ -460,7 +514,7 @@ void run_diff(const char *path, const char *io_path, const char *cache_dir,
 
 void print_bin_diff(const char *path, const char *io_path,
                     const char *cached_path, const char *log_file) {
-  FILE *f1 = fopen(io_path, "rb");
+  FILE *f1 = fopen_watched(io_path, "rb");
   FILE *f2 = fopen_cache(cached_path);
 
   if (!f1 || !f2) {
@@ -475,10 +529,16 @@ void print_bin_diff(const char *path, const char *io_path,
   struct diff_entry diffs[MAX_BIN_DIFFS]; // Store up to 10 differences
 
   size_t offset = 0;
+  size_t next_signal_check = 1 << 20;
   int differences = 0;
   int continue_reading = 1;
 
   while (continue_reading) {
+    // Leave if a signal is waiting, every MiB compared
+    if (offset >= next_signal_check) {
+      stop_if_signalled();
+      next_signal_check = offset + (1 << 20);
+    }
     size_t n1 = fread(buf1, 1, sizeof(buf1), f1);
     size_t n2 = fread(buf2, 1, sizeof(buf2), f2);
 

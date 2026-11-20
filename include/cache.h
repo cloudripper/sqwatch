@@ -15,6 +15,7 @@ extern int cache_dir_fd;
 
 // Function declarations
 int open_cache_file(const char *path, int flags);
+int open_watched_file(const char *io_path);
 int copy_file(const char *src, const char *dest);
 int unlink_cache_file(const char *path);
 void remove_caches(void);

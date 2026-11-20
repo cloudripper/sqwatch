@@ -4,11 +4,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
+#include <sys/prctl.h>
+#include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -18,14 +21,14 @@ pid_t g_last_pid = 0;
 char *cache_dir = NULL;
 sqwatch_config config;
 static const int INITIAL_DIR_WATCHES = 16;
+// SIGINT and SIGTERM are read from here; see main()
+static int signal_fd = -1;
 
+// Runs once SIGINT or SIGTERM has been read from signal_fd, outside any signal
+// handler. The cache goes first, as the command may take its time to exit or
+// ignore signo; another signal, or 5 s, and it is killed
 static void cleanup(int signo) {
   printf(RED "\n+ Exiting SQWatch... \n" RESET);
-
-  if (g_last_pid > 0) {
-    kill(-g_last_pid, signo);
-    waitpid(g_last_pid, NULL, 0);
-  }
 
   // Wipe the cache directory if it exists
   if (cache_dir && cache_dir_owned) {
@@ -33,13 +36,61 @@ static void cleanup(int signo) {
     remove_caches();
   }
 
+  // Wait while anything is left in the command's process group, not only its
+  // leader: a shell may exit on the signal and leave its background jobs. A
+  // zombie still counts as a member; sqwatch is a subreaper (see main()), so
+  // the members it orphaned are its own children and are reaped here
+  if (g_last_pid > 0) {
+    kill(-g_last_pid, signo);
+    for (int waited = 0;; waited += 100) {
+      while (waitpid(-g_last_pid, NULL, WNOHANG) > 0) {
+      }
+      if (kill(-g_last_pid, 0) != 0) {
+        break;
+      }
+      struct pollfd again = {signal_fd, POLLIN, 0};
+      if (waited >= 5000 || poll(&again, 1, 100) > 0) {
+        killpg(g_last_pid, SIGKILL);
+        while (waitpid(-g_last_pid, NULL, 0) > 0) {
+        }
+        break;
+      }
+    }
+  }
+
   free(cache_dir);
   exit(EXIT_SUCCESS);
 }
 
+// Leave through cleanup() if SIGINT or SIGTERM is waiting. Long work outside
+// the event loop calls this, so that a signal does not wait for it to finish
+void stop_if_signalled(void) {
+  struct pollfd pending = {signal_fd, POLLIN, 0};
+  struct signalfd_siginfo info;
+  if (signal_fd >= 0 && poll(&pending, 1, 0) > 0 &&
+      read(signal_fd, &info, sizeof(info)) == (ssize_t)sizeof(info)) {
+    cleanup((int)info.ssi_signo);
+  }
+}
+
 int main(int argc, char *argv[]) {
-  signal(SIGTERM, cleanup);
-  signal(SIGINT, cleanup);
+  // SIGINT and SIGTERM stay blocked and are read from a signalfd by
+  // handle_events(), so the cache is removed here, and a second signal cannot
+  // interrupt that
+  sigset_t stop_signals;
+  sigemptyset(&stop_signals);
+  sigaddset(&stop_signals, SIGINT);
+  sigaddset(&stop_signals, SIGTERM);
+  sigprocmask(SIG_BLOCK, &stop_signals, NULL);
+  signal_fd = signalfd(-1, &stop_signals, SFD_CLOEXEC);
+  if (signal_fd == -1) {
+    perror("signalfd");
+    exit(EXIT_FAILURE);
+  }
+  // Processes the command leaves behind when its shell exits become children
+  // of sqwatch rather than of init, so cleanup() and stop_command() can reap
+  // them and know when the command's process group is really empty
+  prctl(PR_SET_CHILD_SUBREAPER, 1);
   char *command = NULL;
   char *paths[MAX_PATHS];
   int path_count = 0;
@@ -65,7 +116,7 @@ int main(int argc, char *argv[]) {
   config.root_count = 0;
 
   // Determine the default cache directory
-  inotify_fd = inotify_init();
+  inotify_fd = inotify_init1(IN_CLOEXEC);
   if (inotify_fd == -1) {
     perror("inotify_init");
     free(config.dir_watches);  // Clean up if initialization fails
@@ -241,8 +292,7 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  handle_events(inotify_fd, config);
-  cleanup(SIGTERM);
+  cleanup(handle_events(inotify_fd, signal_fd, config));
 
   return EXIT_SUCCESS;
 }

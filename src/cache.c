@@ -100,6 +100,17 @@ int open_cache_file(const char *path, int flags) {
   return fd;
 }
 
+// Open a watched file to read it. With O_NONBLOCK the open fails with
+// EWOULDBLOCK instead of waiting while another process holds a lease on the
+// file; the caller skips the file this time
+int open_watched_file(const char *io_path) {
+  int fd = open(io_path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+  if (fd >= 0) {
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+  }
+  return fd;
+}
+
 int copy_file(const char *src, const char *dest) {
   struct stat statbuf;
 
@@ -111,9 +122,15 @@ int copy_file(const char *src, const char *dest) {
     return -1;
   }
 
-  int src_fd = open(src, O_RDONLY);
+  int src_fd = open_watched_file(src);
   if (src_fd < 0) {
-    perror("Failed to open source file");
+    char shown[PATH_MAX];
+    if (errno == EWOULDBLOCK) {
+      fprintf(stderr, RED "+ Not updating %s this time: another process holds a lease on the file\n" RESET,
+              printable(dest, shown, sizeof(shown)));
+    } else {
+      perror("Failed to open source file");
+    }
     return -1;
   }
 
@@ -130,6 +147,7 @@ int copy_file(const char *src, const char *dest) {
   char buffer[4096];
   ssize_t bytes_read;
   while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0) {
+    stop_if_signalled();
     ssize_t result = write(dest_fd, buffer, bytes_read);
     if (result < 0) {
       perror("Failed to write to destination file");

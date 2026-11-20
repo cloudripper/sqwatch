@@ -62,8 +62,9 @@ typedef struct {
 int add_watch(int inotify_fd, const char *path, int flags);
 void add_watches_recursive(int inotify_fd, const char *path, uint32_t flags, sqwatch_config *config);
 void cache_watched_files(sqwatch_config *config);
-void handle_events(int inotify_fd, sqwatch_config config);
+int handle_events(int inotify_fd, int signal_fd, sqwatch_config config);
 void print_usage(void);
+void stop_if_signalled(void);
 const char *printable(const char *path, char *buf, size_t size);
 
 

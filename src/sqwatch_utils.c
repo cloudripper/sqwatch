@@ -1,10 +1,12 @@
 #define _GNU_SOURCE  // O_PATH
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
+#include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -224,6 +226,7 @@ static void add_watches_walk(int inotify_fd, int parent_fd, const char *name, co
     }
 
     if (S_ISDIR(path_stat.st_mode)) {
+        stop_if_signalled();
         int dir_fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (dir_fd == -1) {
             fprintf(stderr, RED "+ Failed to open directory %s: %s\n" RESET, path, strerror(errno));
@@ -385,6 +388,7 @@ void cache_watched_files(sqwatch_config *config) {
         if (config->watch_paths[i] == NULL) {
             continue;
         }
+        stop_if_signalled();
 
         const watch_root *root = &config->roots[config->watch_roots[i]];
         struct stat st;
@@ -441,13 +445,17 @@ static void stop_command(void) {
 
         g_last_pid = 0;
     }
+    // As a subreaper sqwatch also inherits what an earlier command left
+    // running in a session of its own; reap those that have ended
+    while (waitpid(-1, NULL, WNOHANG) > 0) {
+    }
 }
 
 // Run the user's command in its own process group without waiting for it
 static void start_command(const char *command) {
     if (command != NULL) {
-        // Hold SIGTERM/SIGINT across fork so the child can never run the
-        // handlers installed for sqwatch itself
+        // Hold SIGTERM/SIGINT across fork. sqwatch keeps them blocked and
+        // reads them from a signalfd; the child must get them as usual
         sigset_t block, prev;
         sigemptyset(&block);
         sigaddset(&block, SIGTERM);
@@ -464,7 +472,7 @@ static void start_command(const char *command) {
             // Child process
             signal(SIGTERM, SIG_DFL);
             signal(SIGINT, SIG_DFL);
-            sigprocmask(SIG_SETMASK, &prev, NULL);
+            sigprocmask(SIG_UNBLOCK, &block, NULL);
             setpgid(0, 0);  // Create new process group
             setvbuf(stdout, NULL, _IONBF, 0);
             setvbuf(stderr, NULL, _IONBF, 0);
@@ -481,7 +489,9 @@ static void start_command(const char *command) {
     }
 }
 
-void handle_events(int inotify_fd, sqwatch_config config) {
+// Handle inotify events until SIGINT or SIGTERM is read from signal_fd, and
+// return that signal
+int handle_events(int inotify_fd, int signal_fd, sqwatch_config config) {
     char buffer[BUF_LEN];
     time_t last_event = 0;
     time_t last_create = 0;
@@ -489,6 +499,23 @@ void handle_events(int inotify_fd, sqwatch_config config) {
     char event_buffer[256] = "";
 
     while (1) {
+        struct pollfd fds[2] = {{inotify_fd, POLLIN, 0}, {signal_fd, POLLIN, 0}};
+        if (poll(fds, 2, -1) == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("poll");
+            exit(EXIT_FAILURE);
+        }
+        if (fds[1].revents & POLLIN) {
+            struct signalfd_siginfo info;
+            if (read(signal_fd, &info, sizeof(info)) == (ssize_t)sizeof(info)) {
+                return (int)info.ssi_signo;
+            }
+        }
+        if (!(fds[0].revents & POLLIN)) {
+            continue;
+        }
         ssize_t length = read(inotify_fd, buffer, BUF_LEN);
         if (length == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -501,6 +528,9 @@ void handle_events(int inotify_fd, sqwatch_config config) {
         time_t now = time(NULL);  // Add time_t now declaration
         size_t i = 0;
         while (i + EVENT_SIZE <= (size_t)length) {
+            // A buffer of events can take long to handle: leave between them
+            // if a signal is waiting
+            stop_if_signalled();
             struct inotify_event *event = (struct inotify_event *)&buffer[i];
 
             // Reject invalid inotify descriptors
@@ -735,6 +765,7 @@ void handle_events(int inotify_fd, sqwatch_config config) {
                             char event_desc[256];
                             snprintf(event_desc, sizeof(event_desc), "Modified");
 
+                            stop_if_signalled();
                             run_diff(config.watch_paths[event_wd],
                                 io_path,
                                 cache_dir,
