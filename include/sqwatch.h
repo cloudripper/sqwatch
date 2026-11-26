@@ -154,6 +154,8 @@ void print_usage(void);
 const char *watched_path(dev_t dev, ino_t ino);
 void stop_if_signalled(void);
 void stop_if_output_closed(void);
+void terminal_setup(void);
+void terminal_take_back(void);
 const char *printable(const char *path, char *buf, size_t size);
 const char *shown_name(const char *name);
 const char *shown_text(const char *text);

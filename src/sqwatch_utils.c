@@ -12,6 +12,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <termios.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <errno.h>
@@ -1686,10 +1687,43 @@ static void forget_command_pidfd(void) {
     }
 }
 
+// The terminal: sqwatch hands it to each run, as a shell does to the job it
+// runs in the foreground, so that a command reading its input or setting it
+// up (an editor, `docker run -it`) runs and prints instead of being stopped
+// by SIGTTIN or SIGTTOU. Only when stdin is a terminal and sqwatch was
+// started in its foreground (not with `&`)
+static int terminal_handoff = 0;  // The runs get the terminal
+static int terminal_given = 0;    // The run's process group holds it now
+static int command_interrupted = 0;  // A run that held it ended on SIGINT
+static struct termios terminal_modes;  // As sqwatch found them
+
+void terminal_setup(void) {
+    if (isatty(STDIN_FILENO) && tcgetpgrp(STDIN_FILENO) == getpgrp() &&
+        tcgetattr(STDIN_FILENO, &terminal_modes) == 0) {
+        terminal_handoff = 1;
+        // Taking the terminal back from the background is otherwise stopped
+        // with SIGTTOU, and so is a line written while TOSTOP is set
+        signal(SIGTTOU, SIG_IGN);
+    }
+}
+
+// Make sqwatch's process group the foreground one again, with the modes it
+// found, so that ^C reaches sqwatch once the run that held the terminal is
+// over, even if the run was killed with the terminal in raw mode
+void terminal_take_back(void) {
+    if (terminal_given) {
+        tcsetpgrp(STDIN_FILENO, getpgrp());
+        tcsetattr(STDIN_FILENO, TCSANOW, &terminal_modes);
+        terminal_given = 0;
+    }
+}
+
 static void stop_command(void) {
     forget_command_pidfd();
     if (g_last_pid > 0) {
         killpg(g_last_pid, stop_signal ? stop_signal : SIGTERM);
+        // A stopped process acts on the signal only once continued
+        killpg(g_last_pid, SIGCONT);
         for (int waited = 0;; waited += 10) {
             while (waitpid(-g_last_pid, NULL, WNOHANG) > 0) {
             }
@@ -1708,6 +1742,7 @@ static void stop_command(void) {
         }
         g_last_pid = 0;
     }
+    terminal_take_back();
     // As a subreaper sqwatch also inherits what an earlier command left
     // running in a session of its own; reap those that have ended
     while (waitpid(-1, NULL, WNOHANG) > 0) {
@@ -1750,6 +1785,12 @@ static void start_command(const char *command, const char *path, const char *eve
             signal(SIGPIPE, SIG_DFL);
             sigprocmask(SIG_UNBLOCK, &block, NULL);
             setpgid(0, 0);  // Create new process group
+            if (terminal_handoff) {
+                // Before SIGTTOU is the default again: this is a background
+                // group until then
+                tcsetpgrp(STDIN_FILENO, getpid());
+            }
+            signal(SIGTTOU, SIG_DFL);
             setvbuf(stdout, NULL, _IONBF, 0);
             setvbuf(stderr, NULL, _IONBF, 0);
             setenv("SQWATCH_PATH", path ? path : "", 1);
@@ -1763,6 +1804,10 @@ static void start_command(const char *command, const char *path, const char *eve
         // Also set the group from the parent so a stop right after the
         // start cannot miss it; fails harmlessly once the child has exec'd
         setpgid(g_last_pid, g_last_pid);
+        if (terminal_handoff) {
+            // From the parent as well, so the run never starts without it
+            terminal_given = tcsetpgrp(STDIN_FILENO, g_last_pid) == 0;
+        }
         sigprocmask(SIG_SETMASK, &prev, NULL);
         forget_command_pidfd();
         command_pidfd = (int)syscall(SYS_pidfd_open, g_last_pid, 0);
@@ -1815,11 +1860,26 @@ static void run_command(event_loop *loop, const char *path, const char *event) {
 }
 
 // Whether the command started last is still running: its first process,
-// the shell, has not exited
+// the shell, has not exited. Once it has, or it was stopped (^Z), sqwatch
+// takes the terminal back; a run ended by ^C ends sqwatch too, as ^C was
+// meant for both (see handle_events())
 static int command_running(void) {
-    if (g_last_pid > 0 && waitpid(g_last_pid, NULL, WNOHANG) == 0) {
+    int status;
+    pid_t ended = g_last_pid > 0 ?
+        waitpid(g_last_pid, &status, WNOHANG | (terminal_given ? WUNTRACED : 0)) : -1;
+    if (ended == 0) {
         return 1;
     }
+    if (ended == g_last_pid && WIFSTOPPED(status)) {
+        terminal_take_back();
+        printf(RED "+ Command stopped; it is restarted on the next change\n" RESET);
+        return 1;
+    }
+    if (ended == g_last_pid && terminal_given && WIFSIGNALED(status) &&
+        WTERMSIG(status) == SIGINT) {
+        command_interrupted = 1;
+    }
+    terminal_take_back();
     forget_command_pidfd();
     return 0;
 }
@@ -2623,6 +2683,17 @@ int handle_events(int inotify_fd, int signal_fd, sqwatch_config *config) {
             fds[4].fd = perm_decider_fd();
             if (perm_timeout >= 0 && (timeout < 0 || perm_timeout < timeout)) {
                 timeout = perm_timeout;
+            }
+        }
+        // While the run holds the terminal, ^C goes to it, not to sqwatch:
+        // see every 100 ms whether it is over, to take the terminal back
+        if (terminal_given) {
+            if (!command_running() && command_interrupted) {
+                free(loop.command_path);
+                return SIGINT;
+            }
+            if (terminal_given && (timeout < 0 || timeout > 100)) {
+                timeout = 100;
             }
         }
         stop_if_output_closed();

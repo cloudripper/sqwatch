@@ -37,6 +37,7 @@ static void cleanup(int signo) {
   (void)signo;
   // No process may be left waiting for an answer from sqwatch
   perm_shutdown();
+  terminal_take_back();
   printf(RED "\n+ Exiting SQWatch... \n" RESET);
 
   // Remove this run's cache entries, and the cache directory if this run
@@ -56,6 +57,8 @@ static void cleanup(int signo) {
   // the members it orphaned are its own children and are reaped here
   if (g_last_pid > 0) {
     kill(-g_last_pid, stop_signal ? stop_signal : SIGTERM);
+    // A stopped process acts on the signal only once continued
+    kill(-g_last_pid, SIGCONT);
     for (int waited = 0;; waited += 100) {
       while (waitpid(-g_last_pid, NULL, WNOHANG) > 0) {
       }
@@ -421,6 +424,7 @@ int main(int argc, char *argv[]) {
   // Each line is written as it is made, to a terminal, a pipe or a file
   // alike, so that what sqwatch and the command print stays in order
   setvbuf(stdout, NULL, _IOLBF, 0);
+  terminal_setup();
   char *command = NULL;
   // Every -d and -f, each of them one argument at least
   char **paths = calloc(argc, sizeof(*paths));
