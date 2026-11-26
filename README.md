@@ -92,6 +92,8 @@ Command:
   Quote them: `sqwatch -d src -c 'echo "changed: $SQWATCH_PATH ($SQWATCH_EVENT)"'`. When changes come together (in one batch of events, or inside the debounce window of the last run), they lead to one run, and that run gets the latest of them.
 - `-t SECONDS`: Debounce time of each file, a decimal number of seconds such as `2` or `0.25`, from 0 to 86400 (default: 1, or 0 in observe mode)
 
+  A write is handled once the writer closes the file, so an editor that saves in chunks (helix writes 8 KB at a time) or saves to a new file (vim, helix) gives one run, on the whole file. A writer that keeps the file open is handled after 0.1 s without a write, and at least once per debounce time while it keeps writing.
+
 sqwatch writes its output a line at a time, whether to a terminal, a pipe or a file, and flushes it before it starts the command, so that its lines and the command's stay in order and none is written twice.
 
 When sqwatch runs in the foreground of a terminal, each run of the command gets that terminal, as a shell's foreground job does: interactive commands such as `docker run -it` or an editor read input and print instead of being stopped. While a run holds it, ^C goes to the run; a run ended by ^C ends sqwatch too. Once the run exits or is stopped, sqwatch takes the terminal back with the modes it found.

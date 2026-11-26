@@ -1965,9 +1965,36 @@ static void fire_file(event_loop *loop, file_entry *f, uint32_t mask, int quiet,
 
 // fire_file(), on the file open as file_fd (an O_PATH descriptor, which this
 // closes) if it is not -1, instead of the one f names
+// A write is handled once its writer closes the file, not at its first
+// event: an editor writes a file in chunks (helix, 8 KB each), and the first
+// would run the command on half of it, then again for the rest. A writer that
+// keeps the file open is handled once it has not written for SETTLE_MS, or
+// SETTLE_MS or the debounce time, whichever is longer, after its first write
+#define SETTLE_MS 100
+
+// Defer the write mask to f until its writer is done (see SETTLE_MS), or, in
+// the debounce window of its last change, to when the window closes
+static void settle(event_loop *loop, file_entry *f, uint32_t mask) {
+    if (!(f->last_fire && loop->now - f->last_fire < loop->window)) {
+        if (!f->writing_since) {
+            f->writing_since = loop->now;
+        }
+        long long cap = f->writing_since + (loop->window > SETTLE_MS ? loop->window : SETTLE_MS);
+        f->settle_at = loop->now + SETTLE_MS < cap ? loop->now + SETTLE_MS : cap;
+    }
+    defer(loop->config, f, mask);
+}
+
 static void fire_file_fd(event_loop *loop, file_entry *f, uint32_t mask, int quiet, int force,
                          int file_fd) {
     sqwatch_config *config = loop->config;
+    if (!force && mask == IN_MODIFY) {
+        settle(loop, f, mask);
+        if (file_fd != -1) {
+            close(file_fd);
+        }
+        return;
+    }
     if (!force && f->last_fire && loop->now - f->last_fire < loop->window) {
         defer(config, f, mask);
         if (file_fd != -1) {
@@ -1991,6 +2018,7 @@ static void fire_file_fd(event_loop *loop, file_entry *f, uint32_t mask, int qui
     }
     f->pending = 0;
     f->last_fire = loop->now;
+    f->writing_since = f->settle_at = 0;
     int fd = file_fd != -1 ? file_fd : open_file(config, f);
     int gone = fd == -1 && errno == ENOENT;
     char io_path[FD_PATH_LEN];
@@ -2061,7 +2089,7 @@ static int run_due(event_loop *loop) {
     }
     for (size_t i = 0; i < config->pending_count;) {
         file_entry *f = config->pending[i];
-        long long due = f->last_fire + loop->window;
+        long long due = f->writing_since ? f->settle_at : f->last_fire + loop->window;
         if (due > loop->now) {
             next = next < 0 || due < next ? due : next;
             i++;
@@ -2072,6 +2100,7 @@ static int run_due(event_loop *loop) {
         if (fd == -1 && errno == ENOENT) {
             // Gone from its name: its event, still to come, says where to
             f->last_fire = loop->now;
+            f->writing_since = f->settle_at = 0;
             next = next < 0 || loop->now + loop->window < next ? loop->now + loop->window : next;
             i++;
             continue;
@@ -2107,6 +2136,7 @@ static int run_due(event_loop *loop) {
             config->pending[i]->pending_at = i + 1;
             f->pending_at = 0;
             f->pending = 0;
+            f->writing_since = f->settle_at = 0;
             continue;
         }
         fire_file(loop, f, f->pending, 0, 1);  // takes f out of the list
@@ -2617,10 +2647,18 @@ static void diff_changed(event_loop *loop) {
         if (fd == -1) {
             continue;
         }
-        // A file just created may not be written yet: the write, which its
-        // directory's watch now sees, is diffed then. A file that came back
-        // without events of its own is diffed only if it differs
+        // A file just created may not be written yet, or only in part (an
+        // editor's save to a new file): its writes, which its directory's
+        // watch sees, are handled once it is closed, as any other (see
+        // settle()). One with content and no write to come (a hard link) is
+        // handled when that wait is over. A file that came back without
+        // events of its own is diffed only if it differs
         int unwritten = why == CHANGED_CREATED && fstat(fd, &st) == 0 && st.st_size == 0;
+        if (why == CHANGED_CREATED && !unwritten) {
+            close(fd);
+            settle(loop, f, IN_MODIFY);
+            continue;
+        }
         if (why == CHANGED_RETURNED && !f->pending) {
             char io_path[FD_PATH_LEN];
             fd_path(fd, io_path, sizeof(io_path));

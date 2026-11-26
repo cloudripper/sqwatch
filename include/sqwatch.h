@@ -91,6 +91,8 @@ struct file_entry {
     size_t pending_at;       // window; non-zero while in the pending list
     struct timespec fired_mtime;  // Its modification time and size when its
     off_t fired_size;             // last change was handled
+    long long writing_since; // A write is being settled (see SETTLE_MS):
+    long long settle_at;     // since when, and when it is handled; 0 if not
     unsigned seen;           // The last rescan that found it
     file_entry *next;        // Chain of the name table
 };
