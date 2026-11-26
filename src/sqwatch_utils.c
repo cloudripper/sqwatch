@@ -903,7 +903,7 @@ typedef struct {
     uint32_t pending;
     long long last_fire;
     off_t fired_size;
-    struct timespec fired_ctime;
+    struct timespec fired_mtime;
     long long when;          // ms of CLOCK_MONOTONIC; 0: a free slot
 } departed_name;
 static departed_name departed[DEPARTED_SLOTS];
@@ -958,7 +958,7 @@ static void departed_add(const dir_entry *dir, const char *name, const file_entr
     slot->pending = gone ? gone->pending : 0;
     slot->last_fire = gone ? gone->last_fire : 0;
     slot->fired_size = gone ? gone->fired_size : 0;
-    slot->fired_ctime = gone ? gone->fired_ctime : (struct timespec){0, 0};
+    slot->fired_mtime = gone ? gone->fired_mtime : (struct timespec){0, 0};
     slot->when = now;
 }
 
@@ -1000,7 +1000,7 @@ static int take_departed(sqwatch_config *config, file_entry *f) {
         give_history(f, history);
         f->last_fire = d->last_fire;
         f->fired_size = d->fired_size;
-        f->fired_ctime = d->fired_ctime;
+        f->fired_mtime = d->fired_mtime;
         if (d->pending) {
             defer(config, f, d->pending);
         }
@@ -1999,7 +1999,7 @@ static void fire_file_fd(event_loop *loop, file_entry *f, uint32_t mask, int qui
     // that come after it and belong to it (a close after the write) leave
     // nothing new to show (see run_due())
     if (fd != -1 && (mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_IGNORED)) && fstat(fd, &st) == 0) {
-        f->fired_ctime = st.st_ctim;
+        f->fired_mtime = st.st_mtim;
         f->fired_size = st.st_size;
     }
     if (!quiet || (mask & ~IN_IGNORED)) {
@@ -2077,12 +2077,15 @@ static int run_due(event_loop *loop) {
             continue;
         }
         // Events that came after the write was handled but belong to it (a
-        // close after the write) leave nothing new to show. A write whose
-        // file looks the same (a change time is coarse) is compared with
-        // the cache; without one it is handled. Other events are handled
+        // close after the write) leave nothing new to show: the file has the
+        // size and modification time it had. Not the change time, which an
+        // editor's chmod or ACL after its write moves too (vim). A write
+        // whose file looks the same (a modification time is coarse) is
+        // compared with the cache; without one it is handled. Other events
+        // are handled
         int same = fd == -1 || (fstat(fd, &st) == 0 && st.st_size == f->fired_size &&
-                                st.st_ctim.tv_sec == f->fired_ctime.tv_sec &&
-                                st.st_ctim.tv_nsec == f->fired_ctime.tv_nsec);
+                                st.st_mtim.tv_sec == f->fired_mtime.tv_sec &&
+                                st.st_mtim.tv_nsec == f->fired_mtime.tv_nsec);
         if (same && fd != -1 && (f->pending & ~(IN_MODIFY | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE))) {
             same = 0;
         } else if (same && fd != -1 && (f->pending & IN_MODIFY)) {

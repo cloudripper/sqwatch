@@ -89,7 +89,7 @@ struct file_entry {
                              // CLOCK_MONOTONIC; 0 if never
     uint32_t pending;        // Events deferred to the end of its debounce
     size_t pending_at;       // window; non-zero while in the pending list
-    struct timespec fired_ctime;  // Its status change time and size when its
+    struct timespec fired_mtime;  // Its modification time and size when its
     off_t fired_size;             // last change was handled
     unsigned seen;           // The last rescan that found it
     file_entry *next;        // Chain of the name table
